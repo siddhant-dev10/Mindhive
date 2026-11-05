@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AgentHive — Many Minds. One Mission.</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-layout">
+        <!-- Top Navbar -->
+        <header class="navbar">
+            <div class="brand">
+                <span class="logo-icon">🐝</span>
+                <div class="brand-text">
+                    <h1>AGENTHIVE</h1>
+                    <span class="tagline">Many Minds. One Mission.</span>
+                </div>
+            </div>
+            
+            <div class="nav-status">
+                <div class="status-badge" id="switch-status-badge">
+                    <span class="dot pulse"></span>
+                    <span>Switch Protocol: <strong>ONLINE</strong></span>
+                </div>
+                <div class="status-badge">
+                    <span class="dot green"></span>
+                    <span>Docker Sandbox: <strong>ACTIVE</strong></span>
+                </div>
+                <button class="btn btn-primary" onclick="openNewProjectModal()">+ New Project</button>
+            </div>
+        </header>
+
+        <!-- Main Content Area -->
+        <div class="main-container">
+            <!-- Sidebar: Agent Roster & Projects -->
+            <aside class="sidebar">
+                <div class="section-title">CONNECTED AGENTS (SWITCH)</div>
+                <div class="agent-cards" id="agent-roster">
+                    <div class="agent-card codex">
+                        <div class="agent-avatar">💻</div>
+                        <div class="agent-info">
+                            <div class="agent-name">ChatGPT Codex</div>
+                            <div class="agent-role">Chief Backend Architect</div>
+                        </div>
+                        <span class="badge badge-online">Ready</span>
+                    </div>
+
+                    <div class="agent-card agy">
+                        <div class="agent-avatar">🚀</div>
+                        <div class="agent-info">
+                            <div class="agent-name">AGY (Antigravity)</div>
+                            <div class="agent-role">Systems Integration & CLI</div>
+                        </div>
+                        <span class="badge badge-online">Ready</span>
+                    </div>
+
+                    <div class="agent-card gemini">
+                        <div class="agent-avatar">🧠</div>
+                        <div class="agent-info">
+                            <div class="agent-name">Google Gemini</div>
+                            <div class="agent-role">Deep Reasoning & QA</div>
+                        </div>
+                        <span class="badge badge-online">Ready</span>
+                    </div>
+
+                    <div class="agent-card hermes">
+                        <div class="agent-avatar">👑</div>
+                        <div class="agent-info">
+                            <div class="agent-name">Hermes Supervisor</div>
+                            <div class="agent-role">Swarm Coordinator</div>
+                        </div>
+                        <span class="badge badge-supervisor">Supervisor</span>
+                    </div>
+                </div>
+
+                <div class="section-title" style="margin-top: 24px;">ACTIVE PROJECTS</div>
+                <div class="project-list" id="project-list">
+                    <div class="loading-spinner">Loading projects...</div>
+                </div>
+            </aside>
+
+            <!-- Workspace / Workflow View -->
+            <main class="content-panel">
+                <!-- Project Header -->
+                <div class="project-header" id="active-project-header">
+                    <div>
+                        <div class="project-eyebrow">ACTIVE WORKSPACE</div>
+                        <h2 id="active-project-title">Select or Create a Project</h2>
+                        <p id="active-project-desc" class="project-desc">Initiate an engineering task to begin collaborative multi-agent problem solving.</p>
+                    </div>
+                    <div class="workflow-controls" id="workflow-controls" style="display: none;">
+                        <button class="btn btn-secondary" id="btn-analyse" onclick="triggerAnalyse()">1. Run Independent Analysis</button>
+                        <button class="btn btn-secondary" id="btn-discuss" onclick="triggerDiscuss()">2. Start Switch Debate</button>
+                        <button class="btn btn-secondary" id="btn-assign" onclick="triggerAssign()">3. Hermes Synthesis & WBS</button>
+                        <button class="btn btn-warning" id="btn-approve" onclick="triggerApprove()">4. Human Approval Gate</button>
+                        <button class="btn btn-success" id="btn-execute" onclick="triggerExecute()">5. Execute & Verify</button>
+                    </div>
+                </div>
+
+                <!-- Tabs Navigation -->
+                <div class="tabs-bar">
+                    <button class="tab-btn active" onclick="switchTab('tab-pipeline')">Lifecycle Pipeline</button>
+                    <button class="tab-btn" onclick="switchTab('tab-switch-room')">Switch War Room</button>
+                    <button class="tab-btn" onclick="switchTab('tab-independent')">Independent Proposals</button>
+                    <button class="tab-btn" onclick="switchTab('tab-supervision')">Hermes Supervision & WBS</button>
+                    <button class="tab-btn" onclick="switchTab('tab-execution')">Execution & Tests</button>
+                    <button class="tab-btn" onclick="switchTab('tab-project-md')">PROJECT.md Spec</button>
+                </div>
+
+                <!-- Tab 1: Pipeline Overview -->
+                <div class="tab-pane active" id="tab-pipeline">
+                    <div class="pipeline-flow">
+                        <div class="pipeline-step" id="step-0">
+                            <div class="step-num">01</div>
+                            <div class="step-label">Intake & Spec</div>
+                            <div class="step-status">Pending</div>
+                        </div>
+                        <div class="pipeline-step" id="step-1">
+                            <div class="step-num">02</div>
+                            <div class="step-label">Independent Analysis</div>
+                            <div class="step-status">Pending</div>
+                        </div>
+                        <div class="pipeline-step" id="step-2">
+                            <div class="step-num">03</div>
+                            <div class="step-label">Switch Discussion</div>
+                            <div class="step-status">Pending</div>
+                        </div>
+                        <div class="pipeline-step" id="step-3">
+                            <div class="step-num">04</div>
+                            <div class="step-label">Hermes Synthesis</div>
+                            <div class="step-status">Pending</div>
+                        </div>
+                        <div class="pipeline-step" id="step-4">
+                            <div class="step-num">05</div>
+                            <div class="step-label">Human Gate</div>
+                            <div class="step-status">Pending</div>
+                        </div>
+                        <div class="pipeline-step" id="step-5">
+                            <div class="step-num">06</div>
+                            <div class="step-label">Sandboxed Tests</div>
+                            <div class="step-status">Pending</div>
+                        </div>
+                    </div>
+
+                    <div class="dashboard-grid">
+                        <div class="dash-card">
+                            <div class="dash-card-header">
+                                <h3>Pony Tail Minimalism Guard</h3>
+                                <span class="badge badge-success">ACTIVE: FULL MODE</span>
+                            </div>
+                            <p>Enforcing the 7-Step Ladder of Laziness by Dietrich Gebert. Coding agents strictly prioritize standard libraries before requesting any external packages.</p>
+                            <div class="metric-row">
+                                <div class="metric">
+                                    <div class="metric-val">0</div>
+                                    <div class="metric-lbl">External Packages</div>
+                                </div>
+                                <div class="metric">
+                                    <div class="metric-val">100%</div>
+                                    <div class="metric-lbl">Stdlib Compliance</div>
+                                </div>
+                                <div class="metric">
+                                    <div class="metric-val">&lt;300</div>
+                                    <div class="metric-lbl">Max LOC / File</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="dash-card">
+                            <div class="dash-card-header">
+                                <h3>Governance & Human Sovereignty</h3>
+                                <span class="badge badge-purple">SOVEREIGN PO</span>
+                            </div>
+                            <p>Hermes coordinates and recommends, but code execution and deployments strictly require explicit Project Owner sign-off via Discord or Dashboard.</p>
+                            <div class="human-gate-banner" id="human-gate-banner">
+                                <span>Status: <strong>No pending approval requests.</strong></span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tab 2: Switch War Room -->
+                <div class="tab-pane" id="tab-switch-room">
+                    <div class="chat-room-container">
+                        <div class="chat-room-header">
+                            <span class="room-indicator">● LIVE SWITCH ROOM</span>
+                            <span id="room-name-lbl">No active room</span>
+                        </div>
+                        <div class="chat-messages" id="chat-messages-container">
+                            <div class="empty-msg">No discussion messages yet. Trigger 'Start Switch Debate' to begin.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tab 3: Independent Proposals -->
+                <div class="tab-pane" id="tab-independent">
+                    <div class="independent-grid" id="independent-grid-container">
+                        <div class="empty-msg">Independent analyses not yet initiated.</div>
+                    </div>
+                </div>
+
+                <!-- Tab 4: Hermes Supervision & WBS -->
+                <div class="tab-pane" id="tab-supervision">
+                    <div class="supervision-container" id="supervision-container">
+                        <div class="empty-msg">Supervision synthesis pending discussion completion.</div>
+                    </div>
+                </div>
+
+                <!-- Tab 5: Execution & Tests -->
+                <div class="tab-pane" id="tab-execution">
+                    <div class="execution-container">
+                        <div class="terminal-box">
+                            <div class="terminal-header">
+                                <span>SANDBOX TEST RUNNER (EPHEMERAL EXECUTION)</span>
+                                <span id="test-exit-code-badge" class="badge">EXIT: --</span>
+                            </div>
+                            <pre class="terminal-output" id="terminal-output">Awaiting task execution...</pre>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tab 6: PROJECT.md Spec -->
+                <div class="tab-pane" id="tab-project-md">
+                    <pre class="markdown-viewer" id="project-md-viewer">Select a project to view living PROJECT.md specification.</pre>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <!-- New Project Modal -->
+    <div class="modal-backdrop" id="new-project-modal" style="display: none;">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Create New AgentHive Project</h3>
+                <button class="btn-close" onclick="closeNewProjectModal()">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Project Name</label>
+                    <input type="text" id="modal-project-name" placeholder="e.g. CacheFlow, LogStream, TaskRing" value="LogStream">
+                </div>
+                <div class="form-group">
+                    <label>Project Brief / Requirement</label>
+                    <textarea id="modal-project-desc" rows="4" placeholder="Describe the system to build...">A high-throughput in-memory log stream and query engine with tag indexing, bounded memory (100k records), and regex filtering with zero external pip dependencies.</textarea>
+                </div>
+                <div class="quick-presets">
+                    <span>Quick Hackathon Presets:</span>
+                    <button class="btn-chip" onclick="applyPreset('LogStream', 'High-throughput in-memory log stream and query engine with tag indexing and zero external pip dependencies.')">LogStream</button>
+                    <button class="btn-chip" onclick="applyPreset('MicroRateLimiter', 'Token bucket and sliding window rate limiter in pure Python standard library with nanosecond timestamps.')">RateLimiter</button>
+                    <button class="btn-chip" onclick="applyPreset('EventBus', 'Thread-safe asynchronous event dispatcher with wildcard subscriptions using only native collections and threading.')">EventBus</button>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeNewProjectModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="submitNewProject()">Launch Swarm 🐝</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
