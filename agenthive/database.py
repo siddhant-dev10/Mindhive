@@ -47,6 +47,7 @@ class Database:
                 description TEXT NOT NULL,
                 current_state TEXT NOT NULL DEFAULT 'DRAFT',
                 switch_room_id TEXT,
+                owner_discord_id TEXT,
                 project_md_path TEXT NOT NULL,
                 discord_channel_id TEXT,
                 discord_thread_id TEXT,
@@ -70,6 +71,7 @@ class Database:
                 missing_requirements TEXT NOT NULL,
                 complexity TEXT NOT NULL,
                 raw_payload TEXT,
+                runtime_evidence_json TEXT NOT NULL DEFAULT '{}',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """)
@@ -85,9 +87,30 @@ class Database:
                 sender_role TEXT NOT NULL,
                 reply_to_agent TEXT,
                 content TEXT NOT NULL,
+                switch_event_id TEXT,
+                switch_message_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """)
+
+            # Additive migration for databases created before Switch event IDs were stored.
+            discussion_columns = {
+                row["name"] for row in cursor.execute("PRAGMA table_info(discussion_messages)").fetchall()
+            }
+            if "switch_event_id" not in discussion_columns:
+                cursor.execute("ALTER TABLE discussion_messages ADD COLUMN switch_event_id TEXT")
+            if "switch_message_id" not in discussion_columns:
+                cursor.execute("ALTER TABLE discussion_messages ADD COLUMN switch_message_id TEXT")
+            if "switch_room_id" not in discussion_columns:
+                cursor.execute("ALTER TABLE discussion_messages ADD COLUMN switch_room_id TEXT")
+            project_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(projects)").fetchall()}
+            if "owner_discord_id" not in project_columns:
+                cursor.execute("ALTER TABLE projects ADD COLUMN owner_discord_id TEXT")
+            analysis_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(independent_analyses)").fetchall()}
+            if "runtime_evidence_json" not in analysis_columns:
+                cursor.execute("ALTER TABLE independent_analyses ADD COLUMN runtime_evidence_json TEXT NOT NULL DEFAULT '{}'")
+            if "runtime_evidence_json" not in discussion_columns:
+                cursor.execute("ALTER TABLE discussion_messages ADD COLUMN runtime_evidence_json TEXT NOT NULL DEFAULT '{}'")
 
             # Tasks Table (Phase 6 & 7 WBS)
             cursor.execute("""
@@ -108,6 +131,15 @@ class Database:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """)
+
+            task_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(tasks)").fetchall()}
+            for column, declaration in (
+                ("approved_by", "TEXT"),
+                ("approved_at", "TEXT"),
+                ("approved_task_hash", "TEXT"),
+            ):
+                if column not in task_columns:
+                    cursor.execute(f"ALTER TABLE tasks ADD COLUMN {column} {declaration}")
 
             # Task Execution Logs (Phase 8 Execution & Sandbox)
             cursor.execute("""

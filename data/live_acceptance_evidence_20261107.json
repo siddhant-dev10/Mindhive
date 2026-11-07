@@ -1,0 +1,75 @@
+{
+  "date": "2026-11-07",
+  "verdict": "NOT READY",
+  "discord": {
+    "application_id": "1568557236626792498",
+    "bot_id": "1568557236626792498",
+    "guild_id": "1567933462575325375",
+    "general_channel_id": "1567933463120842765",
+    "owner_user_id": "1027116327997034496",
+    "online_during_verification": true,
+    "guild_commands_synced": 9,
+    "permission_integer": "309237763072",
+    "scopes": [
+      "bot",
+      "applications.commands"
+    ],
+    "intents": {
+      "message_content": true,
+      "server_members": false,
+      "presence": false
+    }
+  },
+  "switch": {
+    "mode": "official",
+    "readiness": "ready",
+    "agents_registered": 4,
+    "sse_streams_connected": 4,
+    "heartbeats_confirmed": true,
+    "shared_discussion_delivery_verified": false
+  },
+  "demo": {
+    "project_id": "e1cd86bf-e4f5-4a7d-a074-f9cc3a259ff0",
+    "slug": "agenthive-live-acceptance-2026-11-07-e1cd86",
+    "discord_workflow": [
+      "newproject",
+      "analyse",
+      "discuss",
+      "assign",
+      "interactive owner approval",
+      "report"
+    ],
+    "report_status": "COMPLETED",
+    "generated_project_tests": {
+      "command": "PYTHONPATH=\"$PWD/workspaces/agenthive-live-acceptance-2026-11-07-e1cd86\" ./venv/bin/python -m unittest discover -s workspaces/agenthive-live-acceptance-2026-11-07-e1cd86/tests",
+      "exit_code": 0,
+      "passed": 7
+    }
+  },
+  "runtime_modes": {
+    "codex": "Native CLI; session IDs observed; timed out during execution task",
+    "agy": "Native CLI available; headless command approval blocked direct task completion",
+    "gemini": "Local fallback; API key missing",
+    "hermes": "Standalone governance; daemon disconnected"
+  },
+  "repository_tests": {
+    "full_suite_passes": 45,
+    "runs": [
+      "826.18s",
+      "840.61s"
+    ],
+    "targeted_gateway": "11 passed in 161.08s; two FastAPI on_event deprecation warnings"
+  },
+  "security_notes": [
+    "No bot token or API key was accessed",
+    "DISCORD_OWNER_ID added to local .env with mode 0600",
+    "Pre-existing AGY process using prohibited --dangerously-skip-permissions was not stopped"
+  ],
+  "post_restart_status": {
+    "status": "degraded",
+    "switch": "official online, 4 registered",
+    "discord": "online, 1 guild, 9 commands",
+    "owner_configured": true,
+    "dashboard_mutations": "403 for approve/reject/execute"
+  }
+}

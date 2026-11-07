@@ -20,46 +20,47 @@ from agenthive.engine.ponytail import PonyTailEngine
 from agenthive.switch.server import switch_state
 from agenthive.models.events import SwitchAgentRegistration, SwitchMessageSend
 from agenthive.discord_gateway.bot import discord_dispatcher
+from agenthive.config import settings
+from agenthive.database import db
 
 @pytest.mark.asyncio
 async def test_human_approval_enforcement():
     """Verify that execution is strictly BLOCKED until human approval is granted."""
     proj_res = await discord_dispatcher.cmd_newproject(
         name="SecurityGateProject",
-        description="Verify human gate prevents unauthorized execution"
+        description="Verify human gate prevents unauthorized execution",
+        user_id=settings.discord_owner_id,
     )
     project_id = proj_res["project_id"]
 
-    await discord_dispatcher.cmd_analyse(project_id)
-    await discord_dispatcher.cmd_discuss(project_id)
-    await discord_dispatcher.cmd_assign(project_id)
+    await discord_dispatcher.cmd_analyse(project_id, actor_id=settings.discord_owner_id)
+    await discord_dispatcher.cmd_discuss(project_id, actor_id=settings.discord_owner_id)
+    await discord_dispatcher.cmd_assign(project_id, actor_id=settings.discord_owner_id)
 
     # Attempt execution WITHOUT approval -> MUST FAIL
-    with pytest.raises(ValueError, match="No tasks approved for execution"):
+    with pytest.raises(PermissionError, match="disabled"):
         await orchestrator.execute_project(project_id)
 
-    # Now grant human approval
-    approve_res = await discord_dispatcher.cmd_approve(project_id)
+    # Record approval in the isolated fixture only; execution must remain separately disabled.
+    approve_res = await discord_dispatcher.cmd_approve(project_id, actor_id=settings.discord_owner_id)
     assert approve_res["success"] is True
-
-    # Now execution succeeds
-    exec_res = await orchestrator.execute_project(project_id)
-    assert exec_res["status"] == "COMPLETED"
+    with pytest.raises(PermissionError, match="disabled"):
+        await orchestrator.execute_project(project_id)
 
 @pytest.mark.asyncio
 async def test_multiple_simultaneous_projects():
     """Verify concurrent projects execute without cross-contamination."""
     # Launch two projects simultaneously
     res1, res2 = await asyncio.gather(
-        discord_dispatcher.cmd_newproject("SimulProjectA", "Concurrent project A"),
-        discord_dispatcher.cmd_newproject("SimulProjectB", "Concurrent project B")
+        discord_dispatcher.cmd_newproject("SimulProjectA", "Concurrent project A", user_id=settings.discord_owner_id),
+        discord_dispatcher.cmd_newproject("SimulProjectB", "Concurrent project B", user_id=settings.discord_owner_id)
     )
     p1_id, p2_id = res1["project_id"], res2["project_id"]
 
     # Run independent analyses concurrently
     a1, a2 = await asyncio.gather(
-        discord_dispatcher.cmd_analyse(p1_id),
-        discord_dispatcher.cmd_analyse(p2_id)
+        discord_dispatcher.cmd_analyse(p1_id, actor_id=settings.discord_owner_id),
+        discord_dispatcher.cmd_analyse(p2_id, actor_id=settings.discord_owner_id)
     )
     assert a1["analyses_count"] == 4
     assert a2["analyses_count"] == 4
@@ -73,19 +74,21 @@ async def test_multiple_simultaneous_projects():
     assert Path(p2.project_md_path).exists()
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("official_switch_runtime")
 async def test_circular_discussion_prevention():
     """Verify discussions strictly respect bounded turns and do not enter infinite loops."""
-    proj_res = await discord_dispatcher.cmd_newproject("LoopPrevent", "Verify bounded turns")
+    proj_res = await discord_dispatcher.cmd_newproject("LoopPrevent", "Verify bounded turns", user_id=settings.discord_owner_id)
     p_id = proj_res["project_id"]
 
     # Run discussion
-    disc_res = await discord_dispatcher.cmd_discuss(p_id)
+    disc_res = await discord_dispatcher.cmd_discuss(p_id, actor_id=settings.discord_owner_id)
     turns = disc_res["turns_completed"]
     assert turns <= 6, f"Expected bounded turns <= 6, got {turns}"
-    # Verify Hermes closes the floor in the final turn
+    # Verify the local governance fallback labels itself and does not claim consensus.
     last_msg = disc_res["messages"][-1]
     assert last_msg["role"] == "SUPERVISOR"
-    assert "Consensus is reached" in last_msg["content"] or "closed" in last_msg["content"].lower()
+    assert "LOCAL GOVERNANCE FALLBACK" in last_msg["content"]
+    assert "has not inferred consensus" in last_msg["content"]
 
 @pytest.mark.asyncio
 async def test_ponytail_unauthorized_import_detection(tmp_path):
@@ -112,7 +115,7 @@ async def test_failed_task_execution_handling(tmp_path):
     """Verify that a failing test suite is properly detected and marks project as FAILED."""
     from agenthive.engine.execution import runner
 
-    bad_workspace = tmp_path / "bad_project"
+    bad_workspace = Path(settings.workspace_root) / "bad_project"
     bad_workspace.mkdir()
     tests_dir = bad_workspace / "tests"
     tests_dir.mkdir()
@@ -129,8 +132,9 @@ async def test_failed_task_execution_handling(tmp_path):
 
     test_res = await runner.run_tests(str(bad_workspace))
     assert test_res["success"] is False
-    assert test_res["exit_code"] != 0
-    assert "Deliberate failure" in test_res["stderr"] or "FAIL" in test_res["stderr"]
+    assert test_res["runtime_mode"] == "blocked_no_secure_runner"
+    assert test_res["exit_code"] is None
+    assert "host execution is disabled" in test_res["stderr"]
 
 @pytest.mark.asyncio
 async def test_database_persistence_across_instances(tmp_path):

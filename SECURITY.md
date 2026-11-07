@@ -1,124 +1,49 @@
-# AgentHive — Security & Reliability Architecture (`SECURITY.md`)
+# AgentHive V2 — Security Model and Current Limits
 
-This document defines the defense-in-depth security model, sandboxing boundaries, credential governance, loop mitigation, and reliability controls protecting **AgentHive**.
+## Dashboard authentication
 
----
+The dashboard exchanges a credential supplied at sign-in for a short-lived signed session cookie. The credential is not stored in JavaScript, local storage, or session storage. The cookie is HttpOnly, SameSite Strict, and Secure in production. Mutating API calls require a valid session, a CSRF token held in page memory, an exact allowed Origin, and a loopback client address. Login attempts are rate-limited in process memory.
 
-## 1. Threat Model & Defense-in-Depth Architecture
+This is a single-owner local dashboard design, not a multi-user identity provider. Configure a private random dashboard credential of at least 32 characters, set exact allowed origins, use HTTPS in production, and set `AGENTHIVE_DASHBOARD_COOKIE_SECURE=true`. Do not expose the dashboard remotely without a separately reviewed proxy/authentication design. Changes are unit-tested through isolated ASGI requests; the live backend has not been restarted to load them.
 
-Multi-agent autonomous systems introduce distinct security attack vectors: prompt injection, runaway resource consumption, unauthorized file access, remote code execution, and credential exfiltration.
+## Owner authorization and approval
 
-AgentHive implements a multi-layered security ring:
+Project reads and mutations require the configured owner. Approval records the owner identity, timestamp, and a hash of the exact task fields. Changes after approval invalidate that evidence. Discord approval and execution are separate user actions. Tests exercise non-owner, stale-task, and unauthenticated cases using temporary databases.
 
-```mermaid
-graph TD
-    subgraph Ring0["Ring 0: Host & Credential Vault"]
-        Keys["API Keys & Host Environment (.env)"]
-        DockerSock["Docker Engine Daemon (Controlled Socket)"]
-    end
+The existing acceptance project is not a test fixture. Its approval state and tasks were not changed in this work.
 
-    subgraph Ring1["Ring 1: Core Orchestrator & Governance"]
-        AH_Engine["FastAPI Orchestrator"]
-        HumanGate["Human-in-the-Loop Sovereign Gate"]
-        LoopGovernor["Token & Turn Budget Governor"]
-    end
+## Workspace and subprocess boundaries
 
-    subgraph Ring2["Ring 2: Collaboration Bus (Switch)"]
-        SwitchRooms["Switch Rooms (HMAC Message Signing)"]
-        DiscordBot["Discord Gateway (Sanitized Webhooks)"]
-    end
+Project workspaces must resolve beneath the configured workspace root, and task workspaces must match the exact project record. Native agent subprocess environments omit AgentHive API credentials. CLI invocations prohibit dangerous permission-bypass arguments (e.g. `--dangerously-skip-permissions` is rejected by security assertions) and bound process lifetime.
 
-    subgraph Ring3["Ring 3: Ephemeral Execution Sandboxes"]
-        DockerSandbox["Ephemeral Container (cap-drop: ALL, net: none)"]
-        CmdWhitelist["Command Whitelist Filter"]
-        WorkspaceMount["Scoped Workspace Mount (/workspaces/proj-xxx)"]
-    end
+Task execution is implemented through a verified isolated non-root container runner:
+- **Non-root execution:** `--user=1001:1001` (or `65534:65534`).
+- **Network isolation:** `--network=none` disables outbound network calls by default during task execution.
+- **Filesystem sandboxing:** Read-only root filesystem with restricted tmpfs on `/tmp:rw,noexec,nosuid,size=64m`.
+- **Zero privilege escalation:** `--cap-drop=ALL` and `--security-opt=no-new-privileges:true`.
+- **Zero Docker socket access:** The Docker socket `/var/run/docker.sock` is never mounted or accessible.
+- **Zero host credential leakage:** Subprocess and container environments are strictly stripped of AgentHive API tokens.
+- **Resource bounds:** 1.0 CPU, 512MB RAM, and 64 PIDs enforced per container.
+- **Execution tracking:** Exact file inventories (SHA-256 and size) are computed before and after task execution.
+- **Fail-closed:** If `AGENTHIVE_TASK_EXECUTION_ENABLED` or `AGENTHIVE_SECURE_AGENT_TASK_RUNNER_CONFIGURED` is false, or if the runner image is missing, task execution fails closed. Host execution is strictly blocked.
 
-    Ring3 -.->|BLOCKED: No access to Host or Secrets| Ring0
-    Ring2 <--> Ring1
-    Ring1 -->|Explicit Approval Required| Ring3
-    Ring0 --> Ring1
-```
+## Official Switch
 
----
+`SWITCH_MODE=official` is the default. Unknown modes fail. Official room discussion must verify participants and actual SSE delivery before saving a message. `SWITCH_MODE=local` is an explicit development/test choice and must be labeled local. No automatic fallback from Official Switch is allowed.
 
-## 2. Agent Isolation & CLI Hardening
+## Secrets
 
-No agent has unrestricted access to the host machine. Every CLI and runtime execution operates under strict sandboxing and workspace scoping:
+- `.env` is ignored by Git; keep it private and mode `0600`.
+- `.env.example` contains blank secret fields and relative, non-user-specific paths.
+- Shareable Compose templates require environment-supplied secrets and a pinned Switch image digest.
+- Several historical report/template files contained credential-like strings. Before sanitizing those copies, the originals were preserved in the ignored `.local-private-evidence/2026-11-07/` directory with directory mode `0700` and file mode `0600`. Do not publish or commit this archive.
+- No credential was rotated, revoked, or authenticated against during this work.
+- Runtime output redaction covers common bearer, Discord, Google, OpenAI, AWS, webhook, URL-password, and private-key patterns. Redaction is defense in depth, not permission to log secrets.
 
-### 2.1 AGY CLI (Antigravity) Hardening
-- **Removal of Unrestricted Bypasses:** The flag `--dangerously-skip-permissions` is **completely banned** and removed from production adapters.
-- **Native Terminal Restrictions:** AGY executes with `--sandbox` enabled at all times.
-- **Granular Tool Permissions:** Instead of blanket auto-approvals, explicit granular permissions are passed per-session via `--settings`:
-  ```json
-  {"permissions": {"allow": ["command(python3)", "command(pytest)", "command(unittest)"]}}
-  ```
-- **Workspace Scoping:** AGY is strictly constrained to the individual project directory via `--add-dir <project_workspace>`, preventing file reads or writes outside the project.
+## Deployment boundaries
 
-### 2.2 Codex CLI (OpenAI) Hardening
-- **Strict Sandbox Policy:** Native `codex exec` is executed with `-s workspace-write`, restricting all file creation, edits, and deletions strictly to the target workspace.
-- **Working Root Confinement:** The root directory is bound via `-C <workspace_dir>`.
-- **Zero Host Escape:** Commands attempting to access host locations (`/etc`, `/Users/sidh._./.ssh`, `/Library`) are blocked by the OS seatbelt sandbox.
+The active Switch/PostgreSQL stack is owned by an external Compose project and Docker-managed volume. The repository templates define a separate stack and volume and have not been launched. Their `latest` dependency has been replaced by a required immutable image reference, but image compatibility, role permissions, health behavior, backup/restore, and migration have not been exercised. No database migration, container restart, or credential rotation was performed.
 
-### 2.3 Filesystem Path Traversal Protection
-The orchestrator performs cryptographic canonical path resolution on every workspace directory before delegating to agents:
-```python
-ws_path = Path(proj.project_md_path).parent.resolve()
-root_path = Path(settings.workspace_root).resolve()
-if not str(ws_path).startswith(str(root_path)):
-    raise PermissionError(f"Security Boundary Violation: Workspace {ws_path} is outside {root_path}")
-```
+## Reporting security defects
 
----
-
-## 3. Sandboxed Container Isolation (Docker)
-
-All untrusted code execution and adversarial verification runs inside strictly hardened, ephemeral Docker containers:
-
-```text
-Docker Security Parameters:
-├── network_mode: none             # Completely offline during execution (zero network exfiltration)
-├── cap_drop: ["ALL"]              # Drop all Linux capabilities (no root privileges)
-├── security_opt: ["no-new-privileges:true"] # Prevent privilege escalation
-├── read_only: false               # Scoped to /app only
-├── user: "1001:1001"              # Enforce non-root execution (agenthive user)
-├── pids_limit: 100                # Prevent fork bombs
-├── cpus: "1.5"                    # Prevent CPU starvation
-└── mem_limit: "1024m"             # Hard 1GB RAM ceiling
-```
-
-- **Ephemeral Lifecycle:** Containers are created per task, executed, and immediately deleted (`--rm`).
-- **Filesystem Confinement:** Only the designated project subdirectory is mounted.
-
----
-
-## 4. Human-in-the-Loop Sovereign Approval Gate
-
-AgentHive enforces a hard sovereign gate between planning and execution. Even if all 4 AI agents agree unanimously on a plan, **zero code executes** until the human Project Owner explicitly authorizes it via Discord or API:
-
-```python
-# Orchestrator Sovereign Approval Enforcement
-if not approved_tasks:
-    raise ValueError("No tasks approved for execution. Project Owner must approve first.")
-```
-
-- **Discord Interactive Buttons:** Projects present an interactive Discord action row with green "Approve & Run" and red "Reject" buttons.
-- **Granular Task Control:** The user can approve the entire WBS plan or selectively authorize individual task codes (e.g. `/approve project_id TASK-01`).
-
----
-
-## 5. Secret Governance & API Key Protection
-
-1. **Zero Secret Exposure Policy:**
-   - API keys (`OPENAI_API_KEY`, `GEMINI_API_KEY`, `DISCORD_BOT_TOKEN`, `SWITCH_API_KEY`) reside exclusively in memory or host environment variables managed by the root daemon.
-   - **Never Written to Disk:** Keys are never written to `PROJECT.md`, task logs, audit trails, or Git repositories.
-   - **Prompt Stripping:** Outgoing prompts dispatched to agents and messages posted to Discord channels are stripped of any secret tokens before broadcast.
-
----
-
-## 6. Infinite Debate Mitigation & Reliability Governance
-
-To guarantee that agent swarms never loop infinitely or exhaust token budgets:
-1. **Turn Limits:** Every discussion round is hard-capped at `MAX_DISCUSSION_TURNS=6`.
-2. **Floor Closure:** Hermes actively monitors agreement and closes the debate floor when consensus is reached.
-3. **Bounded Timeouts:** Subprocess execution times out after 25–40 seconds with graceful fallback recovery.
+Do not include live secret values, partial values, hashes, tokens, or credential-bearing command lines in reports or issues. Report filenames, variable names, affected component, and exposure class only.

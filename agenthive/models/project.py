@@ -18,6 +18,7 @@ class Project(BaseModel):
     description: str
     current_state: str = "DRAFT"  # DRAFT, ANALYZING, DISCUSSING, AWAITING_APPROVAL, EXECUTING, COMPLETED, ABORTED
     switch_room_id: Optional[str] = None
+    owner_discord_id: Optional[str] = None
     project_md_path: str
     discord_channel_id: Optional[str] = None
     discord_thread_id: Optional[str] = None
@@ -36,6 +37,7 @@ class IndependentAnalysis(BaseModel):
     risks: List[str]
     missing_requirements: List[str]
     complexity: str = "MEDIUM"  # LOW, MEDIUM, HIGH, CRITICAL
+    runtime_evidence: Dict[str, Any] = Field(default_factory=dict)
 
 class DiscussionMessage(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
@@ -46,6 +48,10 @@ class DiscussionMessage(BaseModel):
     sender_role: str = "AGENT"  # AGENT, SUPERVISOR, HUMAN_PO, SYSTEM
     reply_to_agent: Optional[str] = None
     content: str
+    switch_event_id: Optional[str] = None
+    switch_message_id: Optional[str] = None
+    switch_room_id: Optional[str] = None
+    runtime_evidence: Dict[str, Any] = Field(default_factory=dict)
     created_at: Optional[str] = None
 
 class TaskItem(BaseModel):
@@ -58,6 +64,9 @@ class TaskItem(BaseModel):
     priority: str = "MEDIUM"  # P0, P1, P2 / HIGH, MEDIUM, LOW
     status: str = "PENDING_APPROVAL"  # PENDING_APPROVAL, APPROVED, IN_PROGRESS, VERIFIED, FAILED, ESCALATED
     human_approved: bool = False
+    approved_by: Optional[str] = None
+    approved_at: Optional[str] = None
+    approved_task_hash: Optional[str] = None
     dependencies: List[str] = []
     acceptance_criteria: List[str] = []
     completion_report: Optional[str] = None
@@ -70,4 +79,5 @@ class HermesSupervisorPlan(BaseModel):
     evaluated_arguments: str
     proposed_roles: Dict[str, str]
     tasks: List[TaskItem]
+    discussion_sources: List[Dict[str, Any]] = Field(default_factory=list)
     requires_human_approval: bool = True

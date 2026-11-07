@@ -1,0 +1,101 @@
+name: agenthive-switch
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${SWITCH_DB_NAME:?Set SWITCH_DB_NAME in the private environment file}
+      POSTGRES_USER: ${SWITCH_DB_OWNER_USER:?Set SWITCH_DB_OWNER_USER in the private environment file}
+      POSTGRES_PASSWORD: ${SWITCH_DB_OWNER_PASSWORD:?Set SWITCH_DB_OWNER_PASSWORD in the private environment file}
+    volumes:
+      - switch_postgres_data:/var/lib/postgresql/data
+    networks:
+      - switch_private
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    cpus: 2.0
+    mem_limit: 1g
+
+  init-db:
+    image: postgres:16-alpine
+    environment:
+      PGPASSWORD: ${SWITCH_DB_OWNER_PASSWORD:?Set SWITCH_DB_OWNER_PASSWORD in the private environment file}
+      SWITCH_DB_NAME: ${SWITCH_DB_NAME:?Set SWITCH_DB_NAME in the private environment file}
+      SWITCH_DB_OWNER_USER: ${SWITCH_DB_OWNER_USER:?Set SWITCH_DB_OWNER_USER in the private environment file}
+      SWITCH_DB_RUNTIME_USER: ${SWITCH_DB_RUNTIME_USER:?Set SWITCH_DB_RUNTIME_USER in the private environment file}
+      SWITCH_DB_RUNTIME_PASSWORD: ${SWITCH_DB_RUNTIME_PASSWORD:?Set SWITCH_DB_RUNTIME_PASSWORD in the private environment file}
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        until pg_isready -h postgres -U "$${SWITCH_DB_OWNER_USER}" -d "$${SWITCH_DB_NAME}"; do sleep 1; done
+        psql -h postgres -U "$${SWITCH_DB_OWNER_USER}" -d "$${SWITCH_DB_NAME}" <<'SQL'
+        \getenv db_name SWITCH_DB_NAME
+        \getenv runtime_user SWITCH_DB_RUNTIME_USER
+        \getenv runtime_password SWITCH_DB_RUNTIME_PASSWORD
+        SELECT format('CREATE ROLE %I LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', :'runtime_user', :'runtime_password')
+          WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'runtime_user') \gexec
+        SELECT format('GRANT CONNECT, CREATE ON DATABASE %I TO %I', :'db_name', :'runtime_user') \gexec
+        SQL
+    networks:
+      - switch_private
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    cpus: 0.5
+    mem_limit: 256m
+
+  switch:
+    image: ${SWITCH_IMAGE:?Set a verified immutable Switch Core image digest in the private environment file}
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${SWITCH_DB_NAME:?Set SWITCH_DB_NAME in the private environment file}
+      DB_USER: ${SWITCH_DB_RUNTIME_USER:?Set SWITCH_DB_RUNTIME_USER in the private environment file}
+      DB_PASSWORD: ${SWITCH_DB_RUNTIME_PASSWORD:?Set SWITCH_DB_RUNTIME_PASSWORD in the private environment file}
+      DB_OWNER_USER: ${SWITCH_DB_OWNER_USER:?Set SWITCH_DB_OWNER_USER in the private environment file}
+      DB_OWNER_PASSWORD: ${SWITCH_DB_OWNER_PASSWORD:?Set SWITCH_DB_OWNER_PASSWORD in the private environment file}
+      ID_SERVER_NAME: ${SWITCH_ID_SERVER_NAME:-switch.local}
+      AGENT_REGISTRATION_TOKEN: ${SWITCH_AGENT_REGISTRATION_TOKEN:?Set SWITCH_AGENT_REGISTRATION_TOKEN in the private environment file}
+      SECRET_KEYS: ${SWITCH_SECRET_KEYS:?Set SWITCH_SECRET_KEYS in the private environment file}
+      GATEWAY_ADMIN_EMAIL: ${SWITCH_GATEWAY_ADMIN_EMAIL:?Set SWITCH_GATEWAY_ADMIN_EMAIL in the private environment file}
+      GATEWAY_ADMIN_PASSWORD: ${SWITCH_GATEWAY_ADMIN_PASSWORD:?Set SWITCH_GATEWAY_ADMIN_PASSWORD in the private environment file}
+      ENVIRONMENT: ${SWITCH_ENVIRONMENT:-production}
+      LOG_LEVEL: ${SWITCH_LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:8080:8000"
+      - "127.0.0.1:8082:8081"
+    networks:
+      - switch_private
+    depends_on:
+      postgres:
+        condition: service_healthy
+      init-db:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    cpus: 2.0
+    mem_limit: 1g
+
+networks:
+  switch_private:
+    internal: true
+
+volumes:
+  switch_postgres_data:
+    name: ${SWITCH_POSTGRES_VOLUME:-agenthive_switch_postgres_data}

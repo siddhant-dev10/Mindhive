@@ -29,7 +29,16 @@ class BaseAgent(abc.ABC):
 
     async def connect_to_switch(self, switch_url: Optional[str] = None):
         url = switch_url or settings.switch_core_url
-        self.client = SwitchAgentClient(url, self.registration)
+        if self.client and self.client.is_connected:
+            return
+        if self.client:
+            await self.client.disconnect()
+        self.client = SwitchAgentClient(
+            url,
+            self.registration,
+            registration_token=settings.switch_registration_token or settings.switch_api_key,
+            mode=settings.switch_mode,
+        )
         await self.client.connect()
 
     async def join_room(self, room_id: str):

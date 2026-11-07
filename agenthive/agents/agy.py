@@ -12,12 +12,14 @@ import json
 import logging
 import os
 import re
+import signal
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-from uuid import uuid4
 from agenthive.agents.base import BaseAgent
 from agenthive.models.project import IndependentAnalysis, TaskItem
 from agenthive.config import settings
+from agenthive.database import db
+from agenthive.security import validate_workspace_path, validate_project_workspace, require_owner_approved_task, prohibit_dangerous_cli_flags, redact_secrets, agent_subprocess_env
 
 logger = logging.getLogger("agenthive.agents.agy")
 
@@ -30,7 +32,14 @@ class AGYAgent(BaseAgent):
             description="Focuses on practical system integration, CLI tools, Docker sandboxing, and repository diagnostics.",
             capabilities=["cli_automation", "docker_sandboxing", "diagnostics", "build_tooling"]
         )
-        self.session_id = str(uuid4())
+        self.session_id: Optional[str] = None
+        self.last_runtime_evidence: Dict[str, Any] = {
+            "runtime_mode": "agy_fallback",
+            "session_id": None,
+            "request_id": None,
+            "exit_status": None,
+            "error_reason": "AGY CLI not invoked",
+        }
         self.binary_path = settings.agy_binary_path
         self.is_cli_available = os.path.exists(self.binary_path) and os.access(self.binary_path, os.X_OK)
         if self.is_cli_available:
@@ -41,15 +50,33 @@ class AGYAgent(BaseAgent):
     async def _run_agy_cli(self, prompt: str, workspace_dir: Optional[str] = None, timeout: int = 35) -> str:
         """Executes the native agy CLI binary with strict workspace isolation and granular permissions."""
         if not self.is_cli_available:
+            self.last_runtime_evidence = {
+                "runtime_mode": "agy_fallback", "session_id": None,
+                "request_id": None, "exit_status": None,
+                "error_reason": "AGY CLI binary unavailable",
+            }
             return self._fallback_response(prompt)
 
-        ws = Path(workspace_dir or settings.workspace_root).resolve()
+        if not workspace_dir:
+            self.last_runtime_evidence = {
+                "runtime_mode": "agy_fallback", "session_id": None,
+                "request_id": None, "exit_status": None,
+                "error_reason": "Project workspace was not supplied; native invocation not started",
+            }
+            return self._fallback_response(prompt)
+        ws = validate_workspace_path(workspace_dir)
         ws.mkdir(parents=True, exist_ok=True)
 
-        # Explicit granular permissions for safe command evaluation
+        # Grant workspace file access only to this project workspace. Commands
+        # stay inside AGY's terminal sandbox; no command-wide auto-approval is used.
         settings_payload = json.dumps({
+            "toolPermission": "proceed-in-sandbox",
             "permissions": {
-                "allow": ["command(python3)", "command(pytest)", "command(unittest)", "command"]
+                "allow": [f"write_file({ws})"],
+                "deny": [
+                    f"write_file({ws / '.git'})",
+                    f"write_file({ws / '.env'})",
+                ],
             }
         })
 
@@ -58,43 +85,164 @@ class AGYAgent(BaseAgent):
             "--sandbox",
             "--add-dir", str(ws),
             "--settings", settings_payload,
+            "--output-format", "json",
             "--print-timeout", f"{timeout}s",
             "-p", prompt
         ]
 
+        # Security Guarantee: Absolutely prohibit --dangerously-skip-permissions
+        prohibit_dangerous_cli_flags(cmd)
+
+        process = None
         try:
             logger.info("Executing native AGY CLI (sandbox enabled, scoped to %s)...", ws)
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=str(ws),
+                env=agent_subprocess_env(),
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-            out_text = stdout.decode().strip()
+            # Give process an extra 10s grace period past CLI print-timeout to flush buffers and cleanly exit
+            process_timeout = timeout + 10
+            communication = asyncio.create_task(process.communicate())
+            stdout, stderr = await asyncio.wait_for(asyncio.shield(communication), timeout=process_timeout)
+            stdout_text = redact_secrets(stdout.decode(errors="replace").strip())
+            stderr_text = redact_secrets(stderr.decode(errors="replace").strip())
+            out_text = stdout_text
+            status = "UNKNOWN"
+            response_text = ""
+            envelope = {}
+            try:
+                envelope = json.loads(stdout_text)
+                if not isinstance(envelope, dict):
+                    raise json.JSONDecodeError("AGY response is not a JSON object", stdout_text, 0)
+                status = str(envelope.get("status", "UNKNOWN"))
+                response_text = str(envelope.get("response") or "")
+                if status != "SUCCESS" or process.returncode != 0 or not response_text.strip():
+                    self.last_runtime_evidence = {
+                        "runtime_mode": "agy_fallback", "session_id": envelope.get("session_id"),
+                        "request_id": envelope.get("request_id"), "process_id": process.pid,
+                        "exit_status": process.returncode,
+                        "error_reason": redact_secrets(str(envelope.get("error") or f"AGY returned status {status}")),
+                    }
+                    logger.warning(
+                        "AGY headless CLI returned status=%s exit=%s: %s",
+                        status,
+                        process.returncode,
+                        redact_secrets(str(envelope.get("error") or stderr_text))[:500],
+                    )
+                    return self._fallback_response(prompt)
+                out_text = response_text.strip()
+            except (TypeError, json.JSONDecodeError):
+                self.last_runtime_evidence = {
+                    "runtime_mode": "agy_fallback", "session_id": None,
+                    "request_id": None, "process_id": process.pid,
+                    "exit_status": process.returncode, "error_reason": "AGY CLI returned malformed JSON output",
+                }
+                logger.warning("AGY headless CLI returned malformed JSON (exit=%s)", process.returncode)
+                return self._fallback_response(prompt)
             if out_text and "no output produced" not in out_text:
+                self.last_runtime_evidence = {
+                    "runtime_mode": "native_agy_cli", "session_id": envelope.get("session_id") if isinstance(envelope, dict) else None,
+                    "request_id": envelope.get("request_id") if isinstance(envelope, dict) else None,
+                    "process_id": process.pid, "exit_status": process.returncode, "error_reason": None,
+                }
+                self.session_id = self.last_runtime_evidence.get("session_id")
                 return out_text
-            logger.info("AGY CLI completed with fallback hint: %s", stderr.decode()[:100] if stderr else "empty")
+            self.last_runtime_evidence = {
+                "runtime_mode": "agy_fallback", "session_id": None,
+                "request_id": None, "process_id": process.pid,
+                "exit_status": process.returncode, "error_reason": "AGY CLI completed without a usable response",
+            }
+            logger.info("AGY CLI completed without usable response (status=%s)", status)
             return self._fallback_response(prompt)
         except asyncio.TimeoutError:
             logger.warning("AGY CLI execution timed out after %ds", timeout)
+            try:
+                if process and process.returncode is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    await asyncio.wait_for(process.wait(), timeout=2)
+            except (ProcessLookupError, asyncio.TimeoutError):
+                try:
+                    if process:
+                        os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+            partial_stdout = partial_stderr = b""
+            if "communication" in locals() and not communication.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(communication), timeout=1)
+                except asyncio.TimeoutError:
+                    communication.cancel()
+                    await asyncio.gather(communication, return_exceptions=True)
+            self.last_runtime_evidence = {
+                "runtime_mode": "agy_fallback", "session_id": None,
+                "request_id": None, "process_id": getattr(process, "pid", None),
+                "exit_status": getattr(process, "returncode", None), "error_reason": f"Timed out after {timeout}s",
+            }
+            if "communication" in locals() and communication.done() and not communication.cancelled():
+                try:
+                    partial_stdout, partial_stderr = communication.result()
+                except Exception:
+                    pass
+            self.last_runtime_evidence["partial_output_chars"] = len(partial_stdout) + len(partial_stderr)
             return self._fallback_response(prompt)
+        except asyncio.CancelledError:
+            if process and process.returncode is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    await asyncio.wait_for(process.wait(), timeout=2)
+                except (ProcessLookupError, asyncio.TimeoutError):
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    await process.wait()
+            raise
         except Exception as e:
-            logger.error("Error executing AGY CLI: %s", e)
+            self.last_runtime_evidence = {
+                "runtime_mode": "agy_fallback", "session_id": None,
+                "request_id": None, "process_id": getattr(process, "pid", None),
+                "exit_status": getattr(process, "returncode", None), "error_reason": type(e).__name__,
+            }
+            logger.error("Error executing AGY CLI (%s)", type(e).__name__)
             return self._fallback_response(prompt)
 
     def _fallback_response(self, prompt: str) -> str:
+        reason = self.last_runtime_evidence.get("error_reason") or "Native AGY CLI did not complete successfully"
         return (
-            "[AGY Integration Engine]\n"
-            "Evaluated environment feasibility: Zero external dependencies required. "
-            "Native standard library CLI interface (`argparse` + `sys.stdin`/`sys.stdout`) selected for cross-platform portability. "
-            "Hardened Alpine container configured with non-root user and dropped capabilities."
+            "[AGY LOCAL FALLBACK — NOT EXECUTED]\n"
+            "The native AGY CLI did not produce an analysis or discussion response. "
+            f"No AGY recommendation was generated. Reason: {redact_secrets(str(reason))[:240]}"
         )
 
     def _parse_field(self, text: str, field_name: str, default: str) -> str:
+        def _clean_val(v: str) -> str:
+            # Strip markdown code delimiters, headers, and bullet noise
+            cleaned = v.strip().lstrip("*#: \t`").rstrip("` \t")
+            # Escape backslashes so downstream regex substitutions (e.g. re.sub in markdown formatters)
+            # do not fail on escape patterns like \l (LaTeX \log) or regex characters \s, \d
+            return cleaned.replace("\\", "\\\\")
+
+        # 1. Match XML-style tags: <FIELD_NAME>...</FIELD_NAME> or <FIELD_NAME>...<OTHER_TAG>
+        tag_match = re.search(rf"<{field_name}>(.*?)(?:</{field_name}>|(?=<\w+>)|\Z)", text, re.DOTALL | re.IGNORECASE)
+        if tag_match:
+            val = _clean_val(tag_match.group(1))
+            if val:
+                return val
+        # 2. Match Markdown or plain key-value: **FIELD_NAME:** ... or FIELD_NAME: ...
+        colon_match = re.search(rf"^[#*\s]*{field_name}[*#\s]*:[*#\s]*(.*?)(?=\n[#*\s]*[A-Z_]+[*#\s]*:|\Z)", text, re.DOTALL | re.IGNORECASE | re.MULTILINE)
+        if colon_match:
+            val = _clean_val(colon_match.group(1))
+            if val:
+                return val
+        # 3. Fallback standard regex
         match = re.search(rf"{field_name}:\s*(.*?)(?=\n[A-Z_]+:|\Z)", text, re.DOTALL | re.IGNORECASE)
         if match:
-            val = match.group(1).strip()
+            val = _clean_val(match.group(1))
             if val:
                 return val
         return default
@@ -105,13 +253,48 @@ class AGYAgent(BaseAgent):
             f"Project: {project_name}\nBrief: {brief}\n"
             f"Output with tags: UNDERSTANDING, ARCHITECTURE, TECH_STACK, PLAN, RISKS, MISSING, COMPLEXITY."
         )
-        raw_output = await self._run_agy_cli(prompt, timeout=25)
+        with db.get_connection() as conn:
+            project_row = conn.execute("SELECT project_md_path FROM projects WHERE id = ?", (project_id,)).fetchone()
+        analysis_workspace = str(Path(project_row["project_md_path"]).parent) if project_row else None
+        if analysis_workspace:
+            raw_output = await self._run_agy_cli(prompt, workspace_dir=analysis_workspace, timeout=40)
+        else:
+            self.last_runtime_evidence = {
+                "runtime_mode": "agy_fallback", "session_id": None,
+                "request_id": None, "exit_status": None,
+                "error_reason": "Project workspace not found; native analysis not started",
+            }
+            raw_output = self._fallback_response(prompt)
+
+        if self.last_runtime_evidence.get("runtime_mode") != "native_agy_cli":
+            return IndependentAnalysis(
+                project_id=project_id,
+                agent_id=self.agent_id,
+                agent_name=self.name,
+                understanding="AGY native analysis was not completed; no AGY recommendation is available.",
+                architecture="No architecture proposal: native AGY CLI did not complete a successful analysis request.",
+                tech_stack=[],
+                implementation_plan=[],
+                risks=["Native AGY analysis unavailable; no AGY risk review was produced"],
+                missing_requirements=[],
+                complexity="UNKNOWN",
+                runtime_evidence=dict(self.last_runtime_evidence),
+            )
+
+        if self.last_runtime_evidence.get("runtime_mode") == "native_agy_cli" and not self._parse_field(raw_output, "UNDERSTANDING", ""):
+            self.last_runtime_evidence = {
+                **self.last_runtime_evidence,
+                "runtime_mode": "agy_fallback",
+                "error_reason": "Native AGY response did not contain the requested analysis fields",
+            }
 
         understanding = self._parse_field(
             raw_output,
             "UNDERSTANDING",
             f"Systems-level integration review for {project_name}: ergonomics, CLI entry points, and environment dependencies."
         )
+        if self.last_runtime_evidence.get("runtime_mode") != "native_agy_cli":
+            understanding = f"[AGY LOCAL FALLBACK] {understanding}"
         architecture = self._parse_field(
             raw_output,
             "ARCHITECTURE",
@@ -156,7 +339,8 @@ class AGYAgent(BaseAgent):
             implementation_plan=plan,
             risks=risks,
             missing_requirements=missing,
-            complexity=complexity
+            complexity=complexity,
+            runtime_evidence=dict(self.last_runtime_evidence),
         )
 
     async def generate_discussion_turn(
@@ -171,71 +355,17 @@ class AGYAgent(BaseAgent):
             f"You are AGY in a Switch room debate for '{project_name}'. "
             f"Provide a 75-word response emphasizing standard library CLI ergonomics and non-root Docker sandboxing."
         )
-        cli_response = await self._run_agy_cli(prompt, timeout=25)
-        if cli_response and len(cli_response) > 40 and "jetski" not in cli_response.lower() and "no output" not in cli_response.lower():
+        with db.get_connection() as conn:
+            project_row = conn.execute("SELECT project_md_path FROM projects WHERE id = ?", (project_id,)).fetchone()
+        discussion_workspace = str(Path(project_row["project_md_path"]).parent) if project_row else None
+        cli_response = await self._run_agy_cli(prompt, workspace_dir=discussion_workspace, timeout=35)
+        if self.last_runtime_evidence.get("runtime_mode") == "native_agy_cli" and cli_response:
             return f"### [INTEGRATION & TOOLING EVALUATION] Turn {turn_index}\n**Speaker:** AGY (Native Antigravity CLI)\n\n{cli_response[:350]}"
 
-        turn_content = (
-            f"### [INTEGRATION & TOOLING EVALUATION] Turn {turn_index}\n"
-            f"**Speaker:** AGY (Systems Integrator)\n"
-            f"**Reviewing:** Swarm Proposals for `{project_name}`\n\n"
-            f"1. **Execution Ergonomics:** I have verified the local workspace. We must avoid complex build tools or heavy packaging. A clean standard library CLI with `argparse` will allow instant execution on macOS, Linux, and Docker.\n"
-            f"2. **Docker Sandboxing:** I will prepare an ephemeral Alpine container (`python:3.11-alpine`) with dropped capabilities (`cap-drop=ALL`) and `network_mode=none` for zero-trust code execution.\n"
-            f"3. **Pony Tail Compliance:** I challenge any proposal to add external third-party dependencies. Everything needed for `{project_name}` can be achieved using native Python standard libraries."
-        )
-        return turn_content
+        return cli_response
 
     async def execute_task(self, task: TaskItem, workspace_dir: str) -> Dict[str, Any]:
-        """Implements CLI harness, Dockerfiles, or runner scripts inside the project workspace."""
-        ws = Path(workspace_dir).resolve()
-        ws.mkdir(parents=True, exist_ok=True)
-        created_files = []
-
-        if "cli" in task.title.lower() or "cli" in task.description.lower():
-            cli_path = ws / "src" / "cli.py"
-            cli_path.parent.mkdir(parents=True, exist_ok=True)
-            cli_code = (
-                "#!/usr/bin/env python3\n"
-                "\"\"\"CLI Interface for AgentHive Project.\"\"\"\n"
-                "import argparse\n"
-                "import sys\n"
-                "import json\n"
-                "from .engine import CoreEngine\n\n"
-                "def main():\n"
-                "    parser = argparse.ArgumentParser(description='AgentHive Verified Application')\n"
-                "    parser.add_argument('--action', choices=['run', 'status', 'test'], default='run')\n"
-                "    parser.add_argument('--payload', type=str, default='{}')\n"
-                "    args = parser.parse_args()\n"
-                "    engine = CoreEngine()\n"
-                "    res = engine.process(args.action, args.payload)\n"
-                "    print(json.dumps(res, indent=2))\n"
-                "    return 0\n\n"
-                "if __name__ == '__main__':\n"
-                "    sys.exit(main())\n"
-            )
-            cli_path.write_text(cli_code)
-            created_files.append(str(cli_path))
-
-        dockerfile_path = ws / "Dockerfile"
-        dockerfile_content = (
-            "FROM python:3.11-alpine\n"
-            "WORKDIR /app\n"
-            "COPY src/ /app/src/\n"
-            "COPY tests/ /app/tests/\n"
-            "RUN adduser -D -u 1001 agenthive && chown -R agenthive:agenthive /app\n"
-            "USER agenthive\n"
-            "ENTRYPOINT [\"python3\", \"-m\", \"unittest\", \"discover\", \"-s\", \"tests\"]\n"
-        )
-        dockerfile_path.write_text(dockerfile_content)
-        created_files.append(str(dockerfile_path))
-
-        execution_mode = "Native AGY CLI (Sandboxed)" if self.is_cli_available else "AGY Systems Engine"
-
-        return {
-            "task_id": task.task_code,
-            "status": "COMPLETED",
-            "agent": self.name,
-            "execution_mode": execution_mode,
-            "created_files": created_files,
-            "report": f"AGY successfully built CLI interface and hardened Alpine Dockerfile ({execution_mode}). Pony Tail verified: 0 external packages."
-        }
+        """Execute task inside the isolated runner."""
+        require_owner_approved_task(task, workspace_dir)
+        from agenthive.engine.execution import runner
+        return await runner.execute_task_isolated(task, workspace_dir)

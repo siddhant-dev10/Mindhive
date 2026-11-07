@@ -8,10 +8,11 @@ import os
 import re
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
+from agenthive.config import settings
 
 # Standard library modules whitelisted in Python 3.9/3.11
 STDLIB_WHITELIST = {
-    "abc", "argparse", "array", "asyncio", "base64", "collections", "concurrent",
+    "__future__", "abc", "argparse", "array", "asyncio", "base64", "builtins", "collections", "concurrent",
     "contextlib", "copy", "csv", "dataclasses", "datetime", "decimal", "difflib",
     "enum", "errno", "fnmatch", "functools", "glob", "gzip", "hashlib", "heapq",
     "hmac", "html", "http", "importlib", "inspect", "io", "itertools", "json",
@@ -103,4 +104,8 @@ class PonyTailEngine:
             "details": results
         }
 
-ponytail_guard = PonyTailEngine()
+ponytail_guard = PonyTailEngine(
+    mode=settings.ponytail_mode,
+    enforce_stdlib_only=settings.ponytail_enforce_stdlib,
+    max_diff_lines=settings.ponytail_max_diff_lines,
+)

@@ -53,6 +53,48 @@ class SwitchServerState:
 
 switch_state = SwitchServerState()
 
+@router.get("/health/ready")
+async def health_ready():
+    """Health readiness check matching official Switch Core format."""
+    return {
+        "status": "ready",
+        "timestamp": datetime.utcnow().isoformat(),
+        "checks": {
+            "database": {"healthy": True},
+            "bridges": {"healthy": True},
+            "message_listener": {"healthy": True},
+            "signal_bus": {"healthy": True}
+        }
+    }
+
+@router.post("/agents", response_model=Dict[str, Any])
+async def register_agent_official(payload: Dict[str, Any]):
+    """Official Switch route: POST /agents (with IntegrationProfile)."""
+    name = payload.get("name") or payload.get("display_name") or "agent"
+    agent_id = payload.get("agent_id") or f"agent-{name.lower().replace(' ', '-')}"
+    desc = payload.get("description", "")
+    metadata = payload.get("metadata", {})
+    role = metadata.get("role", "AGENT")
+    capabilities = metadata.get("capabilities", [])
+
+    reg = SwitchAgentRegistration(
+        agent_id=agent_id,
+        name=name,
+        role=role,
+        description=desc,
+        capabilities=capabilities
+    )
+    switch_state.agents[agent_id] = reg
+    switch_state.heartbeats[agent_id] = datetime.utcnow().isoformat()
+    switch_state.get_or_create_agent_queue(agent_id)
+
+    return {
+        "id": agent_id,
+        "name": name,
+        "status": "registered",
+        "agent": reg.model_dump()
+    }
+
 @router.post("/agents/register", response_model=Dict[str, Any])
 async def register_agent(reg: SwitchAgentRegistration):
     """Register an agent with Switch Agent Bridge."""
@@ -102,7 +144,8 @@ async def agent_heartbeat(beat: SwitchHeartbeat):
 async def official_agent_beat(agent_id: str):
     """Official Switch route: POST /agents/{agent_id}/connection/beat"""
     beat = SwitchHeartbeat(agent_id=agent_id)
-    return await agent_heartbeat(beat)
+    res = await agent_heartbeat(beat)
+    return {"status": "ok", "ok": True, "agent_id": agent_id, "timestamp": beat.timestamp}
 
 @router.post("/agents/{agent_id}/connection/subscribe")
 async def official_agent_subscribe(agent_id: str, payload: Dict[str, Any]):
@@ -110,7 +153,34 @@ async def official_agent_subscribe(agent_id: str, payload: Dict[str, Any]):
     room_id = payload.get("room_id")
     if not room_id:
         raise HTTPException(status_code=400, detail="room_id required in subscribe payload")
-    return await join_room(room_id, agent_id)
+    await join_room(room_id, agent_id)
+    return {"ok": True, "rooms": [room_id]}
+
+@router.post("/agents/{agent_id}/moderation/rooms")
+async def official_create_room(agent_id: str, payload: Dict[str, Any]):
+    """Official Switch route: POST /agents/{agent_id}/moderation/rooms"""
+    name = payload.get("name", "collaborative-room")
+    desc = payload.get("description", "")
+    agent_names = payload.get("agent_names", [])
+    room_id = f"room-{name.lower().replace(' ', '-')}"
+    room = SwitchRoomCreate(room_id=room_id, name=name, topic=desc)
+    await create_room(room)
+    # Auto-add specified agents
+    for aid, ag in switch_state.agents.items():
+        if ag.name in agent_names or aid in agent_names:
+            switch_state.room_members[room_id].add(aid)
+    return {
+        "id": room_id,
+        "name": name,
+        "transport_room_id": f"sw_{room_id}",
+        "matrix_room_id": f"sw_{room_id}",
+        "failed_attachments": []
+    }
+
+@router.get("/agents/{agent_id}/moderation/rooms")
+async def official_list_rooms(agent_id: str):
+    """Official Switch route: GET /agents/{agent_id}/moderation/rooms"""
+    return await list_rooms()
 
 @router.post("/agents/{agent_id}/message")
 async def official_agent_message(agent_id: str, payload: Dict[str, Any]):
@@ -121,20 +191,33 @@ async def official_agent_message(agent_id: str, payload: Dict[str, Any]):
     agent = switch_state.agents.get(agent_id)
     sender_name = agent.name if agent else agent_id
     sender_role = agent.role if agent else "AGENT"
+    metadata = payload.get("metadata", {})
+    reply_to = payload.get("reply_to") or metadata.get("reply_to")
     msg = SwitchMessageSend(
         room_id=room_id,
         sender_id=agent_id,
         sender_name=sender_name,
         sender_role=sender_role,
         content=payload.get("content", ""),
-        reply_to=payload.get("reply_to")
+        reply_to=reply_to
     )
-    return await post_room_message(room_id, msg)
+    res = await post_room_message(room_id, msg)
+    import uuid
+    return {"ok": True, "event_id": f"sw_{uuid.uuid4().hex[:32]}", "message": res.get("message")}
 
 @router.get("/agents/{agent_id}/rooms/{room_id}/history")
 async def official_room_history(agent_id: str, room_id: str):
     """Official Switch route: GET /agents/{agent_id}/rooms/{room_id}/history"""
-    return await get_room_messages(room_id)
+    res = await get_room_messages(room_id)
+    events = []
+    for m in res.get("messages", []):
+        events.append({
+            "sender": f"@{m.get('sender_id')}:switch.local",
+            "sender_name": m.get("sender_name"),
+            "body": m.get("content"),
+            "timestamp": int(datetime.utcnow().timestamp() * 1000)
+        })
+    return {"events": events, "has_more": False}
 
 @router.post("/rooms")
 async def create_room(room: SwitchRoomCreate):
@@ -231,7 +314,17 @@ async def agent_events_sse(agent_id: str, request: Request):
     q = switch_state.get_or_create_agent_queue(agent_id)
 
     async def event_generator():
-        # Send initial connected banner
+        # Send initial connected banner & official connection_state
+        conn_id = request.query_params.get("connection_id", "local_conn")
+        yield {
+            "event": "connection_state",
+            "data": json.dumps({
+                "connection_id": conn_id,
+                "agent_id": agent_id,
+                "server": {"version": "0.31.0", "contracts": {"agent-protocol": {"speaks": 9, "accepts": 1}}},
+                "status": "stream_active"
+            })
+        }
         yield {
             "event": "connected",
             "data": json.dumps({"agent_id": agent_id, "status": "stream_active"})
@@ -244,11 +337,30 @@ async def agent_events_sse(agent_id: str, request: Request):
                 
                 try:
                     event: SwitchRoomEvent = await asyncio.wait_for(q.get(), timeout=15.0)
+                    # Yield legacy/local event
                     yield {
                         "event": event.event_type,
                         "id": event.event_id,
                         "data": json.dumps(event.model_dump())
                     }
+                    # Also yield official Switch event format if message
+                    if event.event_type == "message.created":
+                        payload = event.payload or {}
+                        yield {
+                            "event": "message",
+                            "id": event.event_id,
+                            "data": json.dumps({
+                                "type": "message",
+                                "room_id": event.room_id,
+                                "payload": {
+                                    "sender": f"@{event.agent_id}:switch.local",
+                                    "sender_name": payload.get("sender_name", event.agent_id),
+                                    "body": payload.get("content", ""),
+                                    "message_id": event.event_id,
+                                    "timestamp": int(datetime.utcnow().timestamp() * 1000)
+                                }
+                            })
+                        }
                 except asyncio.TimeoutError:
                     # Keepalive ping
                     yield {

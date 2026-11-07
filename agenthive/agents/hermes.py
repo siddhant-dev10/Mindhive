@@ -10,51 +10,84 @@ import json
 import logging
 import os
 import httpx
+import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-from uuid import uuid4
 from agenthive.agents.base import BaseAgent
 from agenthive.models.project import IndependentAnalysis, TaskItem, HermesSupervisorPlan
 from agenthive.config import settings
+from agenthive.security import validate_workspace_path, validate_project_workspace, require_owner_approved_task
 
 logger = logging.getLogger("agenthive.agents.hermes")
 
 class HermesRuntimeAdapter:
     """Manages connection to the external Nous Research Hermes Agent daemon or CLI."""
-    def __init__(self, daemon_url: str, binary_path: str):
+    def __init__(self, daemon_url: str, binary_path: str, daemon_token: Optional[str] = None):
         self.daemon_url = daemon_url.rstrip("/")
         self.binary_path = binary_path
+        self.daemon_token = daemon_token
         self.is_daemon_connected = False
         self.is_binary_available = os.path.exists(binary_path) and os.access(binary_path, os.X_OK)
+        self.last_health_check = 0.0
+        self.last_health_error: Optional[str] = None
+        self.last_request_id: Optional[str] = None
+        self.last_status_code: Optional[int] = None
 
-    async def check_liveness(self) -> bool:
+    @property
+    def headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.daemon_token}"} if self.daemon_token else {}
+
+    async def check_liveness(self, *, force: bool = False) -> bool:
         """Probes the Hermes daemon for health / liveness."""
+        if not force and time.monotonic() - self.last_health_check < 10.0:
+            return self.is_daemon_connected
         if not self.daemon_url:
             self.is_daemon_connected = False
             return False
+        self.last_health_check = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=2.0) as client:
-                res = await client.get(f"{self.daemon_url}/health")
+                res = await client.get(f"{self.daemon_url}/health", headers=self.headers)
                 self.is_daemon_connected = (res.status_code == 200)
+                self.last_health_error = None if self.is_daemon_connected else f"HTTP {res.status_code}"
                 return self.is_daemon_connected
-        except Exception:
+        except Exception as exc:
             self.is_daemon_connected = False
+            self.last_health_error = type(exc).__name__
             return False
 
     async def query_hermes_daemon(self, prompt: str) -> Optional[str]:
         """Dispatches reasoning request to live Hermes daemon if available."""
         if not self.is_daemon_connected:
             return None
+        self.last_request_id = None
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 res = await client.post(
                     f"{self.daemon_url}/v1/supervise",
-                    json={"prompt": prompt, "temperature": 0.2}
+                    json={"prompt": prompt, "temperature": 0.2},
+                    headers=self.headers,
                 )
                 if res.status_code == 200:
-                    return res.json().get("response")
+                    data = res.json()
+                    response = data.get("response")
+                    if response:
+                        self.is_daemon_connected = True
+                        self.last_health_error = None
+                        self.last_status_code = res.status_code
+                        self.last_request_id = res.headers.get("x-request-id") or data.get("request_id")
+                        return response
+                    self.last_health_error = "Empty daemon response"
+                else:
+                    self.is_daemon_connected = False
+                    self.last_health_error = f"HTTP {res.status_code}"
+                    self.last_status_code = res.status_code
+                    self.last_status_code = res.status_code
         except Exception as e:
-            logger.warning("Hermes daemon dispatch error: %s", e)
+            self.is_daemon_connected = False
+            self.last_health_error = type(e).__name__
+            self.last_status_code = None
+            logger.warning("Hermes daemon dispatch failed (%s)", type(e).__name__)
         return None
 
 class HermesAgent(BaseAgent):
@@ -66,10 +99,18 @@ class HermesAgent(BaseAgent):
             description="Executive coordinator: moderates debate, synthesizes consensus, arbitrates technical conflicts, and generates human-governed WBS plans.",
             capabilities=["moderation", "consensus_synthesis", "conflict_arbitration", "wbs_allocation", "progress_tracking"]
         )
-        self.session_id = str(uuid4())
+        self.session_id = None
+        self.last_runtime_evidence: Dict[str, Any] = {
+            "runtime_mode": "local_governance_fallback",
+            "session_id": None,
+            "request_id": None,
+            "exit_status": None,
+            "error_reason": "Hermes daemon and CLI execution are unavailable",
+        }
         self.runtime_adapter = HermesRuntimeAdapter(
             daemon_url=settings.hermes_daemon_url,
-            binary_path=settings.hermes_binary_path
+            binary_path=settings.hermes_binary_path,
+            daemon_token=settings.hermes_daemon_token,
         )
         logger.info(
             "Hermes Agent initialized (Daemon URL: %s, Binary: %s, Daemon Active: %s)",
@@ -85,41 +126,30 @@ class HermesAgent(BaseAgent):
             "name": self.name,
             "daemon_connected": self.runtime_adapter.is_daemon_connected,
             "binary_available": self.runtime_adapter.is_binary_available,
-            "runtime_mode": "Live Hermes Daemon" if self.runtime_adapter.is_daemon_connected else "Local Supervisory Engine (Standalone Governance Mode - Hermes Daemon Disconnected)"
+            "runtime_mode": "Live Hermes Daemon" if self.runtime_adapter.is_daemon_connected else "LOCAL GOVERNANCE FALLBACK"
         }
 
     async def perform_independent_analysis(self, project_id: str, project_name: str, brief: str) -> IndependentAnalysis:
-        logger.info("Hermes performing independent supervisory framing for %s", project_name)
-        status = self.get_runtime_status()
-        
+        """Record transparent unavailability; governance fallback is not an independent analyst."""
+        self.last_runtime_evidence = {
+            "runtime_mode": "local_governance_fallback",
+            "session_id": None,
+            "request_id": None,
+            "exit_status": None,
+            "error_reason": "Hermes daemon/CLI was not invoked for independent analysis",
+        }
         return IndependentAnalysis(
             project_id=project_id,
             agent_id=self.agent_id,
             agent_name=self.name,
-            understanding=(
-                f"Supervisory coordination review for '{project_name}' [{status['runtime_mode']}]. "
-                f"Mandate: ensure delivery of a robust, cleanly engineered solution that satisfies the PO brief while adhering strictly to Pony Tail minimalism."
-            ),
-            architecture=(
-                "Supervised Swarm Pipeline: Codex leads backend data structures and algorithms, "
-                "AGY leads CLI packaging and Docker sandboxing, Gemini leads verification and QA."
-            ),
-            tech_stack=["Python 3.11 Standard Library", "Docker", "unittest"],
-            implementation_plan=[
-                "Moderate multi-agent discussion rounds",
-                "Synthesize consensus architecture and eliminate dependency bloat",
-                "Generate numbered WBS task matrix with explicit acceptance criteria",
-                "Present plan to Project Owner for formal signoff",
-                "Supervise sandboxed test execution"
-            ],
-            risks=[
-                "Unresolved architectural conflicts between backend performance and simplicity",
-                "Runaway discussion turns without convergence"
-            ],
-            missing_requirements=[
-                "Explicit human signoff gate prior to container code execution"
-            ],
-            complexity="LOW"
+            understanding="Hermes external analysis was not run. The local governance fallback does not claim an independent project review.",
+            architecture="No architecture proposal was generated by Hermes independent analysis.",
+            tech_stack=[],
+            implementation_plan=[],
+            risks=["Hermes daemon/CLI analysis is unavailable"],
+            missing_requirements=[],
+            complexity="UNKNOWN",
+            runtime_evidence=dict(self.last_runtime_evidence),
         )
 
     async def generate_discussion_turn(
@@ -140,18 +170,31 @@ class HermesAgent(BaseAgent):
             daemon_response = await self.runtime_adapter.query_hermes_daemon(prompt)
 
         if daemon_response:
+            self.last_runtime_evidence = {
+                "runtime_mode": "hermes_daemon",
+                "session_id": None,
+                "request_id": self.runtime_adapter.last_request_id,
+                "exit_status": self.runtime_adapter.last_status_code or 200,
+                "error_reason": None,
+            }
             return f"### [SUPERVISOR INTERVENTION & MODERATION] Turn {turn_index}\n**Speaker:** Hermes (Live Hermes Daemon)\n\n{daemon_response}"
 
-        turn_content = (
-            f"### [SUPERVISOR INTERVENTION & MODERATION] Turn {turn_index}\n"
-            f"**Speaker:** Hermes Supervisor ({status['runtime_mode']})\n"
-            f"**To:** All Swarm Agents (Codex, AGY, Gemini)\n\n"
-            f"I have reviewed the debate for `{project_name}`:\n"
-            f"1. **Agreements:** The swarm unanimously agrees on 100% Python standard library (0 external pip dependencies) and containerized Alpine execution.\n"
-            f"2. **Resolution of Gemini's Challenge:** Gemini's point regarding tag index memory bounds is valid. Codex's ring buffer will enforce FIFO boundaries, and Gemini will verify with multithreaded unit tests.\n"
-            f"3. **Debate Floor Closed:** Consensus is reached. I am now closing the discussion floor and synthesizing the formal Work Breakdown Structure (WBS) for Project Owner approval."
+        self.last_runtime_evidence = {
+            "runtime_mode": "local_governance_fallback",
+            "session_id": None,
+            "request_id": None,
+            "exit_status": None,
+            "error_reason": self.runtime_adapter.last_health_error or "Hermes daemon request unavailable; local governance used",
+        }
+
+        observed = [str(item.get("sender_name") or "unknown") for item in room_messages]
+        return (
+            f"### [LOCAL GOVERNANCE STATUS] Turn {turn_index}\n"
+            "**Speaker:** Hermes Supervisor (LOCAL GOVERNANCE FALLBACK — NO DAEMON RESPONSE)\n"
+            f"The local coordinator received {len(room_messages)} earlier persisted messages from: "
+            f"{', '.join(observed) or 'no prior senders'}. It has not inferred consensus or attributed proposals. "
+            "The project owner should review the source messages and the proposed work breakdown before approval."
         )
-        return turn_content
 
     def synthesize_plan(
         self,
@@ -161,108 +204,101 @@ class HermesAgent(BaseAgent):
         analyses: List[IndependentAnalysis],
         discussions: List[Dict[str, Any]]
     ) -> HermesSupervisorPlan:
-        """Synthesizes all independent analyses and debate turns into a formal, capability-aware WBS plan."""
-        logger.info("Hermes synthesizing master plan for %s", project_name)
+        """Create a transparent, generic owner-review checklist from persisted sources."""
+        if not discussions:
+            raise ValueError("Hermes cannot produce a discussion-informed plan without persisted discussion messages")
 
-        agreements = [
-            "100% Python standard library implementation adhering strictly to Pony Tail rules (0 pip dependencies).",
-            "Single-file thread-safe in-memory ring buffer with O(1) performance guarantees.",
-            "Containerized execution in non-root Alpine Docker sandbox with dropped capabilities.",
-            "Independent adversarial verification by Gemini covering race conditions and boundary stress."
+        sources = [
+            {
+                "turn_index": item.get("turn_index"),
+                "sender_id": item.get("sender_id"),
+                "sender_name": item.get("sender_name"),
+                "switch_event_id": item.get("switch_event_id"),
+                "switch_message_id": item.get("switch_message_id"),
+                "excerpt": str(item.get("content") or "")[:300],
+                "runtime_evidence": item.get("runtime_evidence_json"),
+            }
+            for item in discussions
         ]
-        
-        disagreements = [
-            "Tag index memory growth under unbounded FIFO evictions (resolved by Gemini's pruning tests).",
-            "Regex timeout evaluation bounds (resolved by defensive generator pipelines)."
-        ]
-
-        evaluated_arguments = (
-            "Codex proposed high-performance collections.deque storage. Gemini challenged potential tag index leaks. "
-            "AGY confirmed terminal ergonomics and created standard library CLI wrappers. "
-            "Hermes arbitrated in favor of simplicity (Pony Tail full mode) with adversarial verification."
+        ordered_sources = "\n".join(
+            f"- Turn {source['turn_index']} from {source['sender_name']} "
+            f"(event={source['switch_event_id'] or 'unavailable'}, message={source['switch_message_id'] or 'unavailable'}): {source['excerpt']}"
+            for source in sources
         )
-
-        recommended_architecture = (
-            f"AgentHive Verified Architecture for {project_name}:\n"
-            f"• Core Engine: Thread-safe collections.deque ring-buffer with inverted tag indexing (src/engine.py).\n"
-            f"• CLI Interface: Native argparse harness with JSON formatted outputs (src/cli.py).\n"
-            f"• Sandboxing: Non-root Alpine Docker container with network isolation (Dockerfile).\n"
-            f"• QA Matrix: Independent multithreaded adversarial test suite (tests/test_engine.py)."
+        evaluated = (
+            "LOCAL GOVERNANCE FALLBACK: no Hermes daemon/CLI synthesis request was made. "
+            "This is a generic owner-review work breakdown linked to the following persisted discussion messages; "
+            "it does not assert consensus or native-agent agreement.\n" + ordered_sources
         )
-
-        proposed_roles = {
-            "ChatGPT Codex": "Chief Backend Architect (src/engine.py)",
-            "AGY (Antigravity)": "Systems Integration & Packaging (src/cli.py, Dockerfile)",
-            "Google Gemini": "Independent QA & Adversarial Tests (tests/test_engine.py)",
-            "Hermes Supervisor": "Execution Supervision, Verification & Reporting"
+        runtime_modes = {
+            analysis.agent_name: analysis.runtime_evidence.get("runtime_mode", "unknown")
+            for analysis in analyses
         }
-
+        roles = {
+            name: f"Proposed reviewer/implementer; observed analysis runtime: {runtime_modes.get(name, 'not recorded')}"
+            for name in ("ChatGPT Codex", "AGY (Antigravity)", "Google Gemini")
+        }
+        roles["Hermes Supervisor"] = "Local governance fallback; external Hermes runtime not verified"
         tasks = [
             TaskItem(
                 project_id=project_id,
                 task_code="TASK-01",
-                title="Core In-Memory Engine & Storage Primitive",
-                description="Implement thread-safe Record and CoreEngine class using collections.deque with O(1) appends and inverted tag index.",
+                title="Implement the core project requirements",
+                description=f"Implement the requirements recorded in the project brief: {brief}",
                 assigned_agent="ChatGPT Codex",
-                priority="P0",
+                priority="P1",
                 status="PENDING_APPROVAL",
                 acceptance_criteria=[
-                    "Implements collections.deque(maxlen=N)",
-                    "Thread-safe writes via threading.RLock()",
-                    "0 external pip packages installed",
-                    "Clean type annotations"
-                ]
+                    "Implementation is traceable to the project brief",
+                    "Changed files are listed with execution provenance",
+                    "Any added dependency is identified for owner review",
+                ],
             ),
             TaskItem(
                 project_id=project_id,
                 task_code="TASK-02",
-                title="CLI Harness & Sandboxed Docker Packaging",
-                description="Implement CLI interface in src/cli.py and non-root Dockerfile for isolated verification.",
+                title="Review integration and operational requirements",
+                description="Review interfaces, configuration, failure handling, and deployment requirements that apply to this project.",
                 assigned_agent="AGY (Antigravity)",
                 priority="P1",
                 status="PENDING_APPROVAL",
                 dependencies=["TASK-01"],
                 acceptance_criteria=[
-                    "Supports --action and --payload options",
-                    "Returns JSON formatted stdout",
-                    "Dockerfile runs under non-root agenthive user"
-                ]
+                    "Integration assumptions are documented",
+                    "Operational risks and unresolved requirements are recorded",
+                ],
             ),
             TaskItem(
                 project_id=project_id,
                 task_code="TASK-03",
-                title="Adversarial Unit Test Suite & Concurrency Verification",
-                description="Implement comprehensive test matrix in tests/test_engine.py verifying capacity limits, eviction, and multithreaded race conditions.",
+                title="Define and run project-specific verification",
+                description="Create verification cases from the project brief and the actual discussion risks; report test execution evidence.",
                 assigned_agent="Google Gemini",
-                priority="P0",
+                priority="P1",
                 status="PENDING_APPROVAL",
                 dependencies=["TASK-01"],
                 acceptance_criteria=[
-                    "100% pass rate with python -m unittest",
-                    "Verifies 20 concurrent threads writing simultaneously",
-                    "Verifies ring buffer eviction correctness"
-                ]
-            )
+                    "Tests map to stated acceptance criteria",
+                    "Exact command, exit status, and output are recorded",
+                ],
+            ),
         ]
-
         return HermesSupervisorPlan(
             project_id=project_id,
-            recommended_architecture=recommended_architecture,
-            agreements=agreements,
-            disagreements=disagreements,
-            evaluated_arguments=evaluated_arguments,
-            proposed_roles=proposed_roles,
+            recommended_architecture=(
+                "No architecture decision was generated. This local governance plan is a generic owner-review breakdown "
+                "grounded in the project brief and the persisted discussion sources listed below."
+            ),
+            agreements=[],
+            disagreements=["Consensus was not inferred by the local governance fallback."],
+            evaluated_arguments=evaluated,
+            proposed_roles=roles,
             tasks=tasks,
-            requires_human_approval=True
+            discussion_sources=sources,
+            requires_human_approval=True,
         )
 
     async def execute_task(self, task: TaskItem, workspace_dir: str) -> Dict[str, Any]:
-        """Hermes acts as supervisor, validating execution metrics."""
-        status = self.get_runtime_status()
-        return {
-            "task_id": task.task_code,
-            "status": "COMPLETED",
-            "agent": self.name,
-            "runtime_mode": status["runtime_mode"],
-            "report": f"Hermes supervisor verified all task dependencies and execution criteria ({status['runtime_mode']})."
-        }
+        """Hermes is a governance runtime, not a task execution adapter."""
+        require_owner_approved_task(task, workspace_dir)
+        raise PermissionError("Hermes is a governance adapter, not a task execution runtime")
