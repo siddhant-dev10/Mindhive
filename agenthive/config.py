@@ -108,7 +108,14 @@ class Settings:
     # Google Gemini
     gemini_api_key: Optional[str] = os.getenv("GEMINI_API_KEY")
     gemini_model_pro: str = os.getenv("GEMINI_MODEL_PRO", "gemini-2.5-pro")
-    gemini_model_flash: str = os.getenv("GEMINI_MODEL_FLASH", "gemini-2.5-flash")
+    gemini_model_flash: str = os.getenv("GEMINI_MODEL_FLASH", "gemini-3.5-flash")
+    gemini_conversational_model: str = os.getenv(
+        "GEMINI_CONVERSATIONAL_MODEL", os.getenv("GEMINI_MODEL_FLASH", "gemini-3.5-flash")
+    )
+
+    # GitHub Codebase Integration
+    github_token: Optional[str] = os.getenv("GITHUB_TOKEN")
+    github_default_repo: Optional[str] = os.getenv("GITHUB_DEFAULT_REPO")
 
     # Hermes Agent (Nous Research)
     hermes_daemon_url: str = os.getenv("HERMES_DAEMON_URL", "http://localhost:8686")

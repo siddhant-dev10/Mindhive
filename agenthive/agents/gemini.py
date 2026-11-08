@@ -34,8 +34,8 @@ class GeminiAgent(BaseAgent):
             "error_reason": "No Gemini API request has been made",
         }
         self.api_key = settings.gemini_api_key
-        # Default to supported model gemini-2.5-pro / gemini-2.5-flash / gemini-1.5-pro
-        self.model = settings.gemini_model_pro or "gemini-2.5-pro"
+        # Default to supported model gemini-3.5-flash / gemini-3.8-flash
+        self.model = settings.gemini_model_pro or "gemini-3.5-flash"
         self.is_live = bool(self.api_key and not self.api_key.startswith("your_"))
         self.session_history: List[Dict[str, Any]] = []
         self.last_health_check = 0.0

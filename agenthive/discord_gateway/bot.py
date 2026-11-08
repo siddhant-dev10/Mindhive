@@ -7,6 +7,8 @@ Switch room creation, thread mirroring, and headless REST/CLI dispatch.
 
 import asyncio
 import logging
+import re
+import time
 from typing import Optional, Dict, Any, List
 
 from agenthive.config import settings
@@ -48,7 +50,38 @@ if HAS_DISCORD_LIB:
             intents.guilds = True
             super().__init__(intents=intents)
             self.tree = app_commands.CommandTree(self)
+            self._processed_messages: Dict[int, float] = {}
             self._register_commands()
+
+        def _cleanup_processed_messages(self, ttl_seconds: float = 60.0):
+            now = time.monotonic()
+            expired = [mid for mid, ts in self._processed_messages.items() if now - ts > ttl_seconds]
+            for mid in expired:
+                del self._processed_messages[mid]
+
+        def _chunk_text(self, text: str, limit: int = 1950) -> List[str]:
+            if not text:
+                return [""]
+            if len(text) <= limit:
+                return [text]
+
+            chunks = []
+            current = ""
+            for line in text.split("\n"):
+                if len(current) + len(line) + 1 > limit:
+                    if current:
+                        chunks.append(current.strip())
+                        current = ""
+                    if len(line) > limit:
+                        for sub in [line[i:i+limit] for i in range(0, len(line), limit)]:
+                            chunks.append(sub)
+                    else:
+                        current = line + "\n"
+                else:
+                    current += line + "\n"
+            if current.strip():
+                chunks.append(current.strip())
+            return chunks or [text[:limit]]
 
         def _is_project_owner(self, interaction: discord.Interaction) -> bool:
             """Fail closed unless the configured owner ID matches this Discord user."""
@@ -266,6 +299,45 @@ if HAS_DISCORD_LIB:
                 )
                 await interaction.followup.send(embed=embed)
 
+            # 10. /ask
+            @self.tree.command(name="ask", description="Engage MindHive conversational Engineering Manager or request repository analysis")
+            @app_commands.describe(query="Your question, instruction, or workflow request", repo="Optional GitHub repository URL or target path")
+            async def ask_slash(interaction: discord.Interaction, query: str, repo: Optional[str] = None):
+                await interaction.response.defer()
+                user_id = str(interaction.user.id)
+                res = await discord_dispatcher.handle_conversational_message(
+                    text=query,
+                    user_id=user_id,
+                    context_id=f"channel_{interaction.channel_id}",
+                    target_repo=repo,
+                )
+                reply = res.get("response_text", "No response generated.")
+                chunks = self._chunk_text(reply)
+
+                view = None
+                if res.get("requires_approval") and res.get("project_id"):
+                    view = ApprovalView(
+                        project_id=res["project_id"],
+                        po_discord_id=str(settings.discord_owner_id or ""),
+                        project_name=res.get("project_name", res["project_id"])
+                    )
+
+                if len(chunks) == 1:
+                    if view:
+                        msg = await interaction.followup.send(chunks[0], view=view)
+                        view.message = msg
+                    else:
+                        await interaction.followup.send(chunks[0])
+                else:
+                    await interaction.followup.send(chunks[0])
+                    for i, chunk in enumerate(chunks[1:]):
+                        is_last = (i == len(chunks) - 2)
+                        if is_last and view:
+                            msg = await interaction.channel.send(chunk, view=view)
+                            view.message = msg
+                        else:
+                            await interaction.channel.send(chunk)
+
             # Global Tree Error Handler
             @self.tree.error
             async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -306,6 +378,65 @@ if HAS_DISCORD_LIB:
                 await self.change_presence(status=discord.Status.online, activity=activity)
             except Exception as e:
                 logger.debug("Failed setting bot presence: %s", e)
+
+        async def on_message(self, message: discord.Message):
+            """Listens for direct bot mentions or DMs to trigger conversational engineering management."""
+            if message.author.bot or (self.user and message.author.id == self.user.id):
+                return
+
+            # Check if bot is mentioned or if it is a private DM
+            is_dm = isinstance(message.channel, discord.DMChannel)
+            is_mentioned = bool(self.user and self.user in message.mentions)
+            if not is_dm and not is_mentioned:
+                return
+
+            # Deduplication check
+            self._cleanup_processed_messages()
+            if message.id in self._processed_messages:
+                return
+            self._processed_messages[message.id] = time.monotonic()
+
+            # Strip mention tags from content
+            raw_content = message.content or ""
+            if self.user:
+                clean_content = re.sub(rf"<@!?{self.user.id}>", "", raw_content).strip()
+            else:
+                clean_content = raw_content.strip()
+
+            logger.info("Received conversational message from user %s (%s): %s", message.author, message.author.id, clean_content[:80])
+
+            try:
+                async with message.channel.typing():
+                    res = await discord_dispatcher.handle_conversational_message(
+                        text=clean_content or "hello",
+                        user_id=str(message.author.id),
+                        context_id=f"channel_{message.channel.id}",
+                    )
+
+                reply_text = res.get("response_text", "No response generated.")
+                chunks = self._chunk_text(reply_text)
+
+                view = None
+                if res.get("requires_approval") and res.get("project_id"):
+                    view = ApprovalView(
+                        project_id=res["project_id"],
+                        po_discord_id=str(settings.discord_owner_id or ""),
+                        project_name=res.get("project_name", res["project_id"])
+                    )
+
+                for i, chunk in enumerate(chunks):
+                    is_last = (i == len(chunks) - 1)
+                    if is_last and view:
+                        msg = await message.reply(chunk, view=view, mention_author=False)
+                        view.message = msg
+                    else:
+                        await message.reply(chunk, mention_author=False)
+            except Exception as e:
+                logger.error("Error processing conversational message: %s", e, exc_info=True)
+                try:
+                    await message.reply(f"⚠️ **Error:** {str(e)}", mention_author=False)
+                except Exception:
+                    pass
 
     live_discord_bot: Optional[AgentHiveDiscordBot] = None
 

@@ -243,7 +243,7 @@ async def test_gemini_api_call_structure_and_multi_turn_history():
         for req in captured_requests:
             assert req["headers"]["x-goog-api-key"] == "test-mock-api-key-12345"
             assert "?key=" not in req["url"]
-            assert "gemini-2.5-pro" in req["url"]
+            assert agent.model in req["url"]
 
 
 @pytest.mark.asyncio

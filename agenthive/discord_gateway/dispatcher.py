@@ -14,6 +14,8 @@ from agenthive.config import settings
 from agenthive.engine.orchestrator import orchestrator
 from agenthive.database import db
 from agenthive.security import redact_secrets
+from agenthive.services.github_service import codebase_analyzer, parse_repo_target, CodebaseInventory
+from agenthive.services.gemini_service import gemini_service
 
 logger = logging.getLogger("agenthive.discord_gateway.dispatcher")
 
@@ -24,6 +26,7 @@ class DiscordCommandDispatcher:
 
     def __init__(self):
         self._project_locks: Dict[str, asyncio.Lock] = {}
+        self._conversational_sessions: Dict[str, Dict[str, Any]] = {}
 
     def _get_lock(self, project_id: str) -> asyncio.Lock:
         """Retrieves or creates a concurrency lock per project."""
@@ -404,5 +407,248 @@ class DiscordCommandDispatcher:
             except Exception as e:
                 logger.error("Execution/report failed for project %s (%s)", pid, type(e).__name__)
                 return {"command": "/report", "success": False, "error": redact_secrets(str(e))}
+
+    async def handle_conversational_message(
+        self,
+        text: str,
+        user_id: Optional[str] = None,
+        context_id: str = "default",
+        target_repo: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Conversational entry point for MindHive AI Engineering Manager.
+        Handles natural queries, repository analysis, workflow proposals, and Q&A.
+        """
+        raw_text = text.strip() if text else ""
+        if not raw_text:
+            raw_text = "hello"
+
+        session = self._conversational_sessions.setdefault(context_id, {
+            "active_repo": None,
+            "last_project_id": None,
+        })
+
+        try:
+            # Extract repository reference if present
+            repo_candidate = None
+            if target_repo and target_repo.strip():
+                repo_candidate = target_repo.strip()
+            else:
+                url_match = re.search(r"https?://github\.com/([a-zA-Z0-9_\-\.]+)/([a-zA-Z0-9_\-\.]+)", raw_text)
+                if url_match:
+                    repo_candidate = url_match.group(0)
+                else:
+                    repo_flag_match = re.search(r"(?:repo|repository)\s*[:=]?\s*([a-zA-Z0-9_\-\./]+)", raw_text, re.IGNORECASE)
+                    if repo_flag_match:
+                        repo_candidate = repo_flag_match.group(1).strip()
+                    else:
+                        slash_match = re.search(r"\b([a-zA-Z0-9_\-\.]+/[a-zA-Z0-9_\-\.]+)\b", raw_text)
+                        if slash_match and not slash_match.group(1).startswith("http"):
+                            repo_candidate = slash_match.group(1)
+
+            lower = raw_text.lower()
+            is_workflow = any(k in lower for k in [
+                "create a development plan", "development plan", "propose plan",
+                "workflow", "what should we work on", "what work", "propose tasks",
+                "wbs", "plan next", "create plan"
+            ])
+            is_repo_analysis = any(k in lower for k in [
+                "analyse", "analyze", "connect", "inspect",
+                "what does this project do", "what is this project",
+                "explain codebase", "codebase", "architecture"
+            ]) or ("github.com" in lower) or (repo_candidate is not None and not is_workflow)
+
+            is_greeting = not is_workflow and not is_repo_analysis and (
+                bool(re.match(r"^(hello|hi|hey|greetings|who are you|help)\b", lower))
+                or lower in ["hello", "hi", "hey", "help", "who are you"]
+            )
+
+            # 1. GREETING INTENT
+            if is_greeting:
+                switch_status = f"Switch Core at {settings.switch_core_url}"
+                gemini_status = f"Gemini ({gemini_service.model})" if gemini_service.is_configured else "Conversational AI Offline"
+                greeting_text = (
+                    "👋 **Hello! I am MindHive**, an autonomous AI Engineering Manager coordinating a multi-agent team "
+                    "(ChatGPT Codex, Antigravity AGY, Google Gemini, and Nous Hermes) connected via the Official Switch Protocol.\n\n"
+                    "Here is how I can help accelerate your engineering workflow:\n"
+                    "1. **Analyze a Codebase:** Ask `@AgentHive analyse <github-url-or-path>` or `@AgentHive what does this project do?` "
+                    "to inspect architectures, dependencies, entry points, and technical debt.\n"
+                    "2. **Coordinate Multi-Agent Discussions:** Tell me `@AgentHive create a development plan` to start a debate "
+                    "between agents in an Official Switch War Room.\n"
+                    "3. **Propose Structured Workflows:** I synthesize agent proposals into a prioritized WBS with explicit acceptance criteria.\n"
+                    "4. **Human-in-the-Loop Governance:** I enforce strict sovereign human owner approvals before any task execution begins.\n\n"
+                    f"*Active Runtimes: {switch_status} | {gemini_status}*"
+                )
+                return {
+                    "success": True,
+                    "intent": "greeting",
+                    "response_text": greeting_text,
+                    "requires_approval": False,
+                }
+
+            # 2. WORKFLOW PROPOSAL INTENT
+            if is_workflow:
+                if settings.discord_owner_id and user_id and str(user_id) != str(settings.discord_owner_id):
+                    return {
+                        "success": False,
+                        "intent": "workflow_proposal",
+                        "response_text": (
+                            "⛔ **Authorization Denied:** Only the configured MindHive project owner can initiate a development workflow. "
+                            "Please ask the project administrator to authorize or trigger this plan."
+                        ),
+                        "error": "Unauthorized user",
+                        "requires_approval": False,
+                    }
+
+                # Ensure codebase inventory exists
+                inventory: Optional[CodebaseInventory] = session.get("active_repo")
+                if not inventory:
+                    target = repo_candidate or settings.github_default_repo or Path.cwd()
+                    try:
+                        inventory = await codebase_analyzer.analyze(str(target), github_token=settings.github_token)
+                        session["active_repo"] = inventory
+                    except Exception as e:
+                        safe_err = redact_secrets(str(e))
+                        return {
+                            "success": False,
+                            "intent": "workflow_proposal",
+                            "response_text": f"⚠️ **Codebase Analysis Error:** Unable to analyze repository `{target}`: {safe_err}",
+                            "error": safe_err,
+                            "requires_approval": False,
+                        }
+
+                # Create isolated project and switch room
+                clean_name = f"{inventory.repo_name}-DevPlan"[:40]
+                proj_owner = user_id or settings.discord_owner_id or "owner"
+                proj_desc = f"Autonomous development workflow for {inventory.repo_name}: {inventory.description[:120]}"
+                proj = orchestrator.create_project(name=clean_name, description=proj_desc, po_discord_id=proj_owner)
+                session["last_project_id"] = proj.id
+
+                room_id = await orchestrator.create_project_switch_room(proj)
+                analyses = await orchestrator.run_independent_analyses(proj.id)
+                messages = await orchestrator.run_switch_discussion(proj.id)
+                plan = await orchestrator.generate_hermes_plan(proj.id)
+
+                wbs_lines = []
+                for t in plan.tasks:
+                    assigned = t.assigned_agent.value if hasattr(t.assigned_agent, "value") else str(t.assigned_agent)
+                    wbs_lines.append(
+                        f"• **`{t.task_code}` — {t.title}** ({t.priority})\n"
+                        f"  - **Assigned Agent:** {assigned}\n"
+                        f"  - **Acceptance Criteria:** {'; '.join(t.acceptance_criteria)}\n"
+                        f"  - **Dependencies:** {', '.join(t.dependencies) if t.dependencies else 'None'}"
+                    )
+                wbs_text = "\n".join(wbs_lines)
+                switch_mode = "Official Switch Core" if (messages and all(m.switch_event_id for m in messages)) else "Switch Protocol (Local Fallback)"
+
+                plan_text = (
+                    f"## 📋 Proposed Autonomous Development Workflow: `{proj.name}`\n\n"
+                    f"**Project ID:** `{proj.id}`\n"
+                    f"**Switch War Room:** `{room_id}` ({len(messages)} debate turns over {switch_mode})\n\n"
+                    f"### 🏛️ Architectural Consensus\n"
+                    f"{plan.recommended_architecture}\n\n"
+                    f"### 👥 Agent Discussion Highlights\n"
+                    f"- **Agreements:** {'; '.join(plan.agreements[:3]) if plan.agreements else 'Team aligned on architecture.'}\n"
+                    f"- **Risks Identified:** {'; '.join(plan.disagreements[:3]) if plan.disagreements else 'No critical blocking disagreements.'}\n\n"
+                    f"### 🎯 Work Breakdown Structure (WBS)\n"
+                    f"{wbs_text}\n\n"
+                    f"---\n"
+                    f"🔒 **Sovereign Human Approval Gate Active**\n"
+                    f"As an AI Engineering Manager, I **never execute code without human sign-off**. "
+                    f"Review the proposed tasks above and click **Approve Plan** below (or run `/approve {proj.id}`) to unlock execution."
+                )
+
+                return {
+                    "success": True,
+                    "intent": "workflow_proposal",
+                    "project_id": proj.id,
+                    "project_name": proj.name,
+                    "switch_room_id": room_id,
+                    "response_text": plan_text,
+                    "plan": plan.model_dump(),
+                    "requires_approval": True,
+                }
+
+            # 3. REPOSITORY ANALYSIS INTENT
+            if is_repo_analysis:
+                target = repo_candidate or (session.get("active_repo").repo_name if session.get("active_repo") else None) or settings.github_default_repo or Path.cwd()
+                try:
+                    inventory = await codebase_analyzer.analyze(str(target), github_token=settings.github_token)
+                    session["active_repo"] = inventory
+                except Exception as e:
+                    safe_err = redact_secrets(str(e))
+                    return {
+                        "success": False,
+                        "intent": "repo_analysis",
+                        "response_text": f"⚠️ **Codebase Analysis Error:** Unable to analyze repository `{target}`: {safe_err}",
+                        "error": safe_err,
+                        "requires_approval": False,
+                    }
+
+                if gemini_service.is_configured:
+                    prompt = (
+                        f"The user asked: '{raw_text}'. As the Engineering Manager, analyze this repository ({inventory.repo_name}) "
+                        f"for the user. Explain:\n"
+                        f"1. Project identity & core problem solved\n"
+                        f"2. Technical architecture (languages, frameworks, entry points, directory scale)\n"
+                        f"3. Engineering assessment (observed capabilities, gaps/technical debt, testing state)\n"
+                        f"4. Improvement recommendations (priority, rationale, complexity, responsible agent)\n"
+                        f"Reference real observed repository files and manifests."
+                    )
+                    reply = await gemini_service.chat(session_id=context_id, user_message=prompt, codebase_inventory=inventory)
+                    if not reply or reply.startswith("⚠️"):
+                        reply = gemini_service.explain_codebase_deterministic(inventory)
+                else:
+                    reply = gemini_service.explain_codebase_deterministic(inventory)
+
+                return {
+                    "success": True,
+                    "intent": "repo_analysis",
+                    "response_text": reply,
+                    "repo_inventory": inventory.to_dict(),
+                    "requires_approval": False,
+                }
+
+            # 4. GENERAL CHAT / FOLLOW-UP INTENT
+            active_repo = session.get("active_repo")
+            if gemini_service.is_configured:
+                reply = await gemini_service.chat(
+                    session_id=context_id,
+                    user_message=raw_text,
+                    codebase_inventory=active_repo,
+                )
+            elif active_repo:
+                reply = (
+                    f"I am actively tracking repository `{active_repo.repo_name}` ({active_repo.primary_language}).\n\n"
+                    f"{gemini_service.explain_codebase_deterministic(active_repo)}\n\n"
+                    f"> *To ask freeform conversational questions, configure `GEMINI_API_KEY` in `.env`.*"
+                )
+            else:
+                reply = (
+                    "👋 I am MindHive, your AI Engineering Manager. I can inspect your GitHub repository, "
+                    "coordinate multi-agent discussions over Official Switch, and generate WBS development workflows.\n\n"
+                    "Try asking:\n"
+                    "- `@AgentHive analyse <github-url-or-path>`\n"
+                    "- `@AgentHive create a development plan`\n"
+                    "- Or use `/ask` with your query.\n\n"
+                    "> *Note: For freeform conversational LLM answers, configure `GEMINI_API_KEY` in `.env`.*"
+                )
+
+            return {
+                "success": True,
+                "intent": "general_chat",
+                "response_text": reply,
+                "requires_approval": False,
+            }
+
+        except Exception as e:
+            safe_error = redact_secrets(str(e))
+            logger.error("Error in handle_conversational_message: %s", safe_error, exc_info=True)
+            return {
+                "success": False,
+                "intent": "error",
+                "response_text": f"⚠️ **MindHive Error:** {safe_error}",
+                "error": safe_error,
+                "requires_approval": False,
+            }
 
 discord_dispatcher = DiscordCommandDispatcher()
